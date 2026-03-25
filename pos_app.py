@@ -14,7 +14,7 @@ import logging
 from datetime import datetime
 from contextlib import contextmanager
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, redirect
 import razorpay
 import qrcode
 import psycopg2
@@ -318,6 +318,82 @@ def complete_payment():
 @app.route("/receipt/<receipt_id>")
 def view_receipt(receipt_id):
     return render_template("receipt.html", receipt_id=receipt_id)
+
+
+# ── Admin Panel ───────────────────────────────────────────────────────────────
+
+@app.route("/admin")
+def admin_panel():
+    """Admin panel — list all products."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM products ORDER BY category, name"
+            )
+            products = [dict(r) for r in cur.fetchall()]
+    return render_template("admin.html", products=products)
+
+
+@app.route("/admin/add", methods=["POST"])
+def admin_add_product():
+    """Add a new product via the admin form."""
+    try:
+        barcode      = request.form.get("barcode", "").strip()
+        name         = request.form.get("name", "").strip()
+        price        = float(request.form.get("price", 0))
+        weight_grams = request.form.get("weight_grams", None)
+        category     = request.form.get("category", "General").strip()
+        stock        = int(request.form.get("stock", 0))
+
+        if not barcode or not name or price <= 0:
+            return jsonify({"success": False, "error": "barcode, name and price are required"}), 400
+
+        weight_grams = int(weight_grams) if weight_grams else None
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO products (barcode, name, price, weight_grams, category, stock)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (barcode) DO UPDATE
+                        SET name = EXCLUDED.name,
+                            price = EXCLUDED.price,
+                            weight_grams = EXCLUDED.weight_grams,
+                            category = EXCLUDED.category,
+                            stock = EXCLUDED.stock,
+                            updated_at = NOW()
+                    """,
+                    (barcode, name, price, weight_grams, category, stock)
+                )
+        return redirect("/admin")
+
+    except Exception as e:
+        logger.error("Error adding product: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/admin/delete/<barcode>", methods=["POST"])
+def admin_delete_product(barcode: str):
+    """Delete a product by barcode."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM products WHERE barcode = %s", (barcode,))
+        return redirect("/admin")
+    except Exception as e:
+        logger.error("Error deleting product: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/api/admin/products")
+def api_admin_products():
+    """JSON list of all products — used by the POS dashboard to refresh the grid."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT barcode, name, price, category, stock FROM products ORDER BY category, name")
+            products = {r["barcode"]: dict(r) for r in cur.fetchall()}
+    return jsonify({"success": True, "products": products})
 
 
 @app.route("/health")
