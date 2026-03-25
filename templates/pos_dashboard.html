@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>POS Payment System</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        .product-card {
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+        .product-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.15);
+        }
+        .scan-line {
+            animation: scan 2s linear infinite;
+        }
+        @keyframes scan {
+            0% { transform: translateY(0); }
+            50% { transform: translateY(100px); }
+            100% { transform: translateY(0); }
+        }
+        .fade-in {
+            animation: fadeIn 0.5s ease-in;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <!-- Header -->
+    <header class="bg-blue-600 text-white shadow-lg">
+        <div class="container mx-auto px-4 py-4">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-3">
+                    <i class="fas fa-cash-register text-2xl"></i>
+                    <h1 class="text-2xl font-bold">POS Payment System</h1>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <div class="text-sm">
+                        <span id="itemCount" class="bg-yellow-400 text-blue-800 px-2 py-1 rounded-full font-bold">0</span>
+                        Items Scanned
+                    </div>
+                    <div class="text-sm font-bold">
+                        Total: <span id="headerTotal">₹0.00</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="container mx-auto px-4 py-8">
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <!-- Product Scanner & List -->
+            <div class="lg:col-span-2">
+                <!-- Scanner Section -->
+                <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+                    <h2 class="text-xl font-bold mb-4 text-gray-800">
+                        <i class="fas fa-barcode text-blue-500 mr-2"></i>
+                        Product Scanner
+                    </h2>
+                    <div class="flex space-x-4">
+                        <input type="text" id="scanInput" placeholder="Enter Product ID (1001-1010)" 
+                               class="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        <input type="number" id="quantityInput" placeholder="Qty" min="1" value="1"
+                               class="w-20 px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        <button onclick="scanProduct()" 
+                                class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition">
+                            <i class="fas fa-search mr-2"></i>Scan
+                        </button>
+                    </div>
+                    <div id="scanResult" class="mt-4 hidden"></div>
+                </div>
+
+                <!-- Products Grid -->
+                <div class="bg-white rounded-lg shadow-md p-6">
+                    <h2 class="text-xl font-bold mb-4 text-gray-800">
+                        <i class="fas fa-th-large text-green-500 mr-2"></i>
+                        Available Products
+                    </h2>
+                    <div class="grid grid-cols-2 md:grid-cols-3 gap-4" id="productsGrid">
+                        <!-- Products will be loaded here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Shopping Cart -->
+            <div class="lg:col-span-1">
+                <div class="bg-white rounded-lg shadow-md p-6 sticky top-4">
+                    <h2 class="text-xl font-bold mb-4 text-gray-800">
+                        <i class="fas fa-receipt text-orange-500 mr-2"></i>
+                        Receipt List
+                    </h2>
+                    
+                    <!-- Receipt Header -->
+                    <div class="border-b-2 border-gray-800 pb-2 mb-4">
+                        <div class="text-center">
+                            <h3 class="font-bold text-lg">SALES RECEIPT</h3>
+                            <p class="text-xs text-gray-600" id="receiptDate"></p>
+                        </div>
+                    </div>
+                    
+                    <!-- Receipt Items -->
+                    <div id="receiptItems" class="space-y-1 mb-4 max-h-80 overflow-y-auto">
+                        <p class="text-gray-500 text-center italic">No items scanned yet...</p>
+                    </div>
+                    
+                    <!-- Receipt Footer -->
+                    <div class="border-t-2 border-gray-800 pt-2">
+                        <div class="space-y-1">
+                            <div class="flex justify-between text-sm">
+                                <span>Subtotal:</span>
+                                <span id="subtotal">₹0.00</span>
+                            </div>
+                            <div class="flex justify-between text-sm">
+                                <span>GST (18%):</span>
+                                <span id="tax">₹0.00</span>
+                            </div>
+                            <div class="flex justify-between text-lg font-bold border-t pt-1">
+                                <span>TOTAL:</span>
+                                <span id="total" class="text-blue-600">₹0.00</span>
+                            </div>
+                        </div>
+                        
+                        <div class="mt-4 space-y-2">
+                            <button onclick="generateQRCode()" 
+                                    class="w-full bg-green-600 text-white py-3 rounded-lg hover:bg-green-700 transition disabled:bg-gray-400 font-semibold"
+                                    id="payButton" disabled>
+                                <i class="fas fa-qrcode mr-2"></i>Pay Now
+                            </button>
+                            <button onclick="clearReceipt()" 
+                                    class="w-full bg-red-600 text-white py-2 rounded-lg hover:bg-red-700 transition">
+                                <i class="fas fa-trash mr-2"></i>Clear Receipt
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- QR Code Modal -->
+    <div id="qrModal" class="fixed inset-0 bg-black bg-opacity-50 hidden flex items-center justify-center z-50">
+        <div class="bg-white rounded-lg p-8 max-w-md w-full mx-4 fade-in">
+            <h3 class="text-xl font-bold mb-4 text-center">
+                <i class="fas fa-qrcode text-green-500 mr-2"></i>
+                Scan to Pay
+            </h3>
+            <div id="qrCodeContainer" class="text-center mb-4">
+                <!-- QR Code will be displayed here -->
+            </div>
+            <div id="paymentInfo" class="text-center mb-4">
+                <p class="text-lg font-semibold">Total Amount: <span id="modalTotal" class="text-blue-600">₹0.00</span></p>
+                <p class="text-sm text-gray-600">Scan QR code with any UPI app</p>
+                <p class="text-xs text-orange-600 mt-2" id="scanStatus">Waiting for QR scan...</p>
+            </div>
+            <div class="flex space-x-4">
+                <button onclick="markQRScanned()" 
+                        class="flex-1 bg-blue-600 text-white py-2 rounded-lg hover:bg-blue-700 transition"
+                        id="qrScannedBtn">
+                    <i class="fas fa-qrcode mr-2"></i>I've Scanned QR
+                </button>
+                <button onclick="closeQRModal()" 
+                        class="flex-1 bg-gray-600 text-white py-2 rounded-lg hover:bg-gray-700 transition">
+                    <i class="fas fa-times mr-2"></i>Cancel
+                </button>
+            </div>
+            <div id="simulatePaymentSection" class="hidden mt-4">
+                <div class="border-t pt-4">
+                    <p class="text-center text-sm text-gray-600 mb-3">QR Code scanned! Complete payment:</p>
+                    <button onclick="simulatePayment()" 
+                            class="w-full bg-green-600 text-white py-3 rounded-lg hover:bg-green-700 transition font-semibold">
+                        <i class="fas fa-check mr-2"></i>Simulate Payment
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Receipt Modal -->
+    <div id="receiptModal" class="fixed inset-0 bg-black bg-opacity-50 hidden flex items-center justify-center z-50">
+        <div class="bg-white rounded-lg p-8 max-w-md w-full mx-4 fade-in">
+            <h3 class="text-xl font-bold mb-4 text-center">
+                <i class="fas fa-receipt text-green-500 mr-2"></i>
+                Payment Receipt
+            </h3>
+            <div id="receiptContent">
+                <!-- Receipt will be displayed here -->
+            </div>
+            <div class="mt-6 space-y-2">
+                <button onclick="printReceipt()" 
+                        class="w-full bg-blue-600 text-white py-2 rounded-lg hover:bg-blue-700 transition">
+                    <i class="fas fa-print mr-2"></i>Print Receipt
+                </button>
+                <button onclick="closeReceiptModal()" 
+                        class="w-full bg-gray-600 text-white py-2 rounded-lg hover:bg-gray-700 transition">
+                    <i class="fas fa-times mr-2"></i>Close
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Global variables
+        let cart = [];
+        let currentOrder = null;
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadProducts();
+            loadReceipt();
+            updateReceiptDate();
+            
+            // Add enter key support for scanner
+            document.getElementById('scanInput').addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    scanProduct();
+                }
+            });
+        });
+
+        // Update receipt date
+        function updateReceiptDate() {
+            const now = new Date();
+            const dateStr = now.toLocaleDateString('en-IN', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+            document.getElementById('receiptDate').textContent = dateStr;
+        }
+
+        // Load products
+        function loadProducts() {
+            const productsGrid = document.getElementById('productsGrid');
+            const products = {
+                "1001": {"name": "Laptop", "price": 45000, "category": "Electronics"},
+                "1002": {"name": "Mouse", "price": 800, "category": "Electronics"},
+                "1003": {"name": "Keyboard", "price": 1500, "category": "Electronics"},
+                "1004": {"name": "Monitor", "price": 12000, "category": "Electronics"},
+                "1005": {"name": "Headphones", "price": 2000, "category": "Electronics"},
+                "1006": {"name": "USB Cable", "price": 200, "category": "Accessories"},
+                "1007": {"name": "Webcam", "price": 2500, "category": "Electronics"},
+                "1008": {"name": "Phone Case", "price": 500, "category": "Accessories"},
+                "1009": {"name": "Power Bank", "price": 1500, "category": "Electronics"},
+                "1010": {"name": "Bluetooth Speaker", "price": 3000, "category": "Electronics"}
+            };
+
+            productsGrid.innerHTML = Object.entries(products).map(([id, product]) => `
+                <div class="product-card bg-gray-50 rounded-lg p-4 text-center">
+                    <div class="text-3xl mb-2">
+                        <i class="fas fa-${getProductIcon(product.name)} text-blue-500"></i>
+                    </div>
+                    <h3 class="font-semibold text-sm">${product.name}</h3>
+                    <p class="text-xs text-gray-600">${product.category}</p>
+                    <p class="font-bold text-blue-600">₹${product.price}</p>
+                    <p class="text-xs text-gray-500">ID: ${id}</p>
+                    <div class="mt-2 flex items-center justify-center space-x-2">
+                        <input type="number" id="qty_${id}" min="1" value="1" 
+                               class="w-16 px-2 py-1 text-xs border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500">
+                        <button onclick="quickAddToReceipt('${id}')" 
+                                class="bg-green-500 text-white px-3 py-1 text-xs rounded hover:bg-green-600 transition">
+                            Add
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function getProductIcon(productName) {
+            const icons = {
+                'Laptop': 'laptop',
+                'Mouse': 'computer-mouse',
+                'Keyboard': 'keyboard',
+                'Monitor': 'display',
+                'Headphones': 'headphones',
+                'USB Cable': 'usb',
+                'Webcam': 'video',
+                'Phone Case': 'mobile',
+                'Power Bank': 'battery-full',
+                'Bluetooth Speaker': 'volume-high'
+            };
+            return icons[productName] || 'box';
+        }
+
+        // Scan product
+        async function scanProduct() {
+            const productId = document.getElementById('scanInput').value.trim();
+            const quantity = parseInt(document.getElementById('quantityInput').value) || 1;
+            const resultDiv = document.getElementById('scanResult');
+            
+            if (!productId) {
+                showNotification('Please enter a product ID', 'error');
+                return;
+            }
+
+            try {
+                const response = await axios.post('/api/scan_product', { product_id: productId });
+                
+                if (response.data.success) {
+                    resultDiv.innerHTML = `
+                        <div class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded">
+                            <strong>Scanned:</strong> ${response.data.product.name} - ₹${response.data.product.price} x ${quantity}
+                        </div>
+                    `;
+                    resultDiv.classList.remove('hidden');
+                    
+                    // Auto add to receipt with quantity
+                    await addToReceipt(productId, quantity);
+                    
+                    // Clear input
+                    document.getElementById('scanInput').value = '';
+                    document.getElementById('quantityInput').value = '1';
+                    
+                    // Hide result after 2 seconds
+                    setTimeout(() => {
+                        resultDiv.classList.add('hidden');
+                    }, 2000);
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `
+                    <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded">
+                        <strong>Error:</strong> ${error.response?.data?.message || 'Product not found'}
+                    </div>
+                `;
+                resultDiv.classList.remove('hidden');
+            }
+        }
+
+        // Quick add to receipt
+        async function quickAddToReceipt(productId) {
+            const quantity = parseInt(document.getElementById(`qty_${productId}`).value) || 1;
+            await addToReceipt(productId, quantity);
+            // Reset quantity to 1 after adding
+            document.getElementById(`qty_${productId}`).value = 1;
+        }
+
+        // Add to receipt
+        async function addToReceipt(productId, quantity = 1) {
+            try {
+                const response = await axios.post('/api/add_to_cart', {
+                    product_id: productId,
+                    quantity: quantity
+                });
+                
+                if (response.data.success) {
+                    cart = response.data.cart;
+                    updateReceiptDisplay();
+                    showNotification('Product added to receipt', 'success');
+                }
+            } catch (error) {
+                showNotification('Failed to add product to receipt', 'error');
+            }
+        }
+
+        // Load receipt
+        async function loadReceipt() {
+            try {
+                const response = await axios.get('/api/get_cart');
+                if (response.data.success) {
+                    cart = response.data.cart;
+                    updateReceiptDisplay();
+                }
+            } catch (error) {
+                console.error('Error loading receipt:', error);
+            }
+        }
+
+        // Update receipt display
+        function updateReceiptDisplay() {
+            const receiptItems = document.getElementById('receiptItems');
+            const itemCount = document.getElementById('itemCount');
+            const headerTotal = document.getElementById('headerTotal');
+            const subtotal = document.getElementById('subtotal');
+            const tax = document.getElementById('tax');
+            const total = document.getElementById('total');
+            const payButton = document.getElementById('payButton');
+
+            if (cart.length === 0) {
+                receiptItems.innerHTML = '<p class="text-gray-500 text-center italic">No items scanned yet...</p>';
+                payButton.disabled = true;
+            } else {
+                // Display items in receipt format - one by one
+                receiptItems.innerHTML = cart.map((item, index) => `
+                    <div class="border-b border-gray-200 pb-1 mb-1 fade-in">
+                        <div class="flex justify-between items-start">
+                            <div class="flex-1">
+                                <span class="text-sm font-semibold">${index + 1}. ${item.name}</span>
+                                <div class="text-xs text-gray-600">
+                                    ₹${item.price} × ${item.quantity}
+                                </div>
+                            </div>
+                            <div class="text-right">
+                                <span class="font-bold text-sm">₹${item.total}</span>
+                                <button onclick="removeFromReceipt('${item.id}')" 
+                                        class="ml-2 text-red-500 hover:text-red-700">
+                                    <i class="fas fa-times text-xs"></i>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+                payButton.disabled = false;
+            }
+
+            const cartTotal = cart.reduce((sum, item) => sum + item.total, 0);
+            const taxAmount = cartTotal * 0.18;
+            const totalAmount = cartTotal + taxAmount;
+
+            itemCount.textContent = cart.length;
+            headerTotal.textContent = `₹${totalAmount.toFixed(2)}`;
+            subtotal.textContent = `₹${cartTotal.toFixed(2)}`;
+            tax.textContent = `₹${taxAmount.toFixed(2)}`;
+            total.textContent = `₹${totalAmount.toFixed(2)}`;
+        }
+
+        // Remove from receipt
+        async function removeFromReceipt(productId) {
+            try {
+                const response = await axios.post('/api/remove_from_cart', { product_id: productId });
+                if (response.data.success) {
+                    cart = response.data.cart;
+                    updateReceiptDisplay();
+                    showNotification('Item removed from receipt', 'success');
+                }
+            } catch (error) {
+                showNotification('Failed to remove item', 'error');
+            }
+        }
+
+        // Clear receipt
+        async function clearReceipt() {
+            if (cart.length === 0) return;
+            
+            if (confirm('Are you sure you want to clear the receipt?')) {
+                try {
+                    const response = await axios.post('/api/clear_cart');
+                    if (response.data.success) {
+                        cart = [];
+                        updateReceiptDisplay();
+                        updateReceiptDate();
+                        showNotification('Receipt cleared', 'success');
+                    }
+                } catch (error) {
+                    showNotification('Failed to clear receipt', 'error');
+                }
+            }
+        }
+
+        // Mark QR as scanned
+        function markQRScanned() {
+            // Update UI to show QR was scanned
+            document.getElementById('scanStatus').textContent = 'QR Code scanned successfully!';
+            document.getElementById('scanStatus').className = 'text-xs text-green-600 mt-2';
+            
+            // Hide the scan button and show simulate payment section
+            document.getElementById('qrScannedBtn').style.display = 'none';
+            document.getElementById('simulatePaymentSection').classList.remove('hidden');
+        }
+
+        // Generate QR Code
+        async function generateQRCode() {
+            if (cart.length === 0) {
+                showNotification('Cart is empty', 'error');
+                return;
+            }
+
+            try {
+                const response = await axios.post('/api/create_payment_order');
+                
+                if (response.data.success) {
+                    currentOrder = response.data.order;
+                    
+                    // Reset modal state
+                    document.getElementById('scanStatus').textContent = 'Waiting for QR scan...';
+                    document.getElementById('scanStatus').className = 'text-xs text-orange-600 mt-2';
+                    document.getElementById('qrScannedBtn').style.display = 'block';
+                    document.getElementById('simulatePaymentSection').classList.add('hidden');
+                    
+                    // Show QR code modal with final total including GST
+                    document.getElementById('qrCodeContainer').innerHTML = `
+                        <img src="${response.data.qr_code}" alt="Payment QR Code" class="mx-auto pulse">
+                    `;
+                    
+                    // Display both subtotal and final total
+                    document.getElementById('modalTotal').innerHTML = `
+                        <div class="space-y-1">
+                            <p class="text-sm text-gray-600">Subtotal: ₹${response.data.cart_total.toFixed(2)}</p>
+                            <p class="text-sm text-gray-600">GST (18%): ₹${response.data.gst_amount.toFixed(2)}</p>
+                            <p class="text-lg font-semibold text-blue-600">Final Total: ₹${response.data.final_total.toFixed(2)}</p>
+                        </div>
+                    `;
+                    
+                    document.getElementById('qrModal').classList.remove('hidden');
+                }
+            } catch (error) {
+                showNotification('Failed to generate QR code', 'error');
+            }
+        }
+
+        // Simulate payment
+        async function simulatePayment() {
+            if (!currentOrder) return;
+
+            try {
+                // Show processing state
+                document.getElementById('simulatePaymentSection').innerHTML = `
+                    <div class="border-t pt-4">
+                        <p class="text-center text-sm text-gray-600 mb-3">Processing payment...</p>
+                        <div class="flex justify-center">
+                            <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-green-600"></div>
+                        </div>
+                    </div>
+                `;
+
+                const response = await axios.post('/api/complete_payment', {
+                    order_id: currentOrder.id,
+                    payment_id: `pay_demo_${Date.now()}`
+                });
+                
+                if (response.data.success) {
+                    closeQRModal();
+                    showReceipt(response.data.receipt);
+                    showNotification('Payment completed successfully!', 'success');
+                }
+            } catch (error) {
+                showNotification('Payment failed', 'error');
+                // Reset modal state on error
+                document.getElementById('simulatePaymentSection').innerHTML = `
+                    <div class="border-t pt-4">
+                        <p class="text-center text-sm text-gray-600 mb-3">QR Code scanned! Complete payment:</p>
+                        <button onclick="simulatePayment()" 
+                                class="w-full bg-green-600 text-white py-3 rounded-lg hover:bg-green-700 transition font-semibold">
+                            <i class="fas fa-check mr-2"></i>Simulate Payment
+                        </button>
+                    </div>
+                `;
+            }
+        }
+
+        // Show receipt
+        function showReceipt(receipt) {
+            const receiptContent = document.getElementById('receiptContent');
+            receiptContent.innerHTML = `
+                <div class="text-left space-y-2">
+                    <div class="text-center border-b pb-2">
+                        <h4 class="font-bold text-lg">Payment Receipt</h4>
+                        <p class="text-sm text-gray-600">${receipt.receipt_id}</p>
+                    </div>
+                    
+                    <div>
+                        <p class="text-sm"><strong>Date:</strong> ${receipt.date}</p>
+                        <p class="text-sm"><strong>Order ID:</strong> ${receipt.order_id}</p>
+                        <p class="text-sm"><strong>Payment ID:</strong> ${receipt.payment_id}</p>
+                        <p class="text-sm"><strong>Method:</strong> ${receipt.payment_method}</p>
+                    </div>
+                    
+                    <div class="border-t pt-2">
+                        <h5 class="font-semibold mb-2">Items:</h5>
+                        ${receipt.items.map(item => `
+                            <div class="flex justify-between text-sm">
+                                <span>${item.name} x ${item.quantity}</span>
+                                <span>₹${item.total}</span>
+                            </div>
+                        `).join('')}
+                    </div>
+                    
+                    <div class="border-t pt-2">
+                        <div class="flex justify-between text-sm">
+                            <span>Subtotal:</span>
+                            <span>₹${receipt.subtotal}</span>
+                        </div>
+                        <div class="flex justify-between text-sm">
+                            <span>GST (18%):</span>
+                            <span>₹${receipt.tax}</span>
+                        </div>
+                        <div class="flex justify-between font-bold">
+                            <span>Total:</span>
+                            <span>₹${receipt.total}</span>
+                        </div>
+                    </div>
+                    
+                    <div class="text-center pt-2 border-t">
+                        <span class="inline-block bg-green-100 text-green-800 px-3 py-1 rounded-full text-sm font-semibold">
+                            <i class="fas fa-check-circle mr-1"></i>${receipt.status}
+                        </span>
+                    </div>
+                </div>
+            `;
+            
+            document.getElementById('receiptModal').classList.remove('hidden');
+        }
+
+        // Close modals
+        function closeQRModal() {
+            document.getElementById('qrModal').classList.add('hidden');
+        }
+
+        function closeReceiptModal() {
+            document.getElementById('receiptModal').classList.add('hidden');
+        }
+
+        // Print receipt
+        function printReceipt() {
+            window.print();
+        }
+
+        // Show notification
+        function showNotification(message, type = 'success') {
+            const notification = document.createElement('div');
+            notification.className = `fixed top-4 right-4 px-6 py-3 rounded-lg shadow-lg z-50 ${
+                type === 'success' ? 'bg-green-500' : 'bg-red-500'
+            } text-white`;
+            notification.textContent = message;
+            document.body.appendChild(notification);
+            
+            setTimeout(() => {
+                notification.remove();
+            }, 3000);
+        }
+    </script>
+</body>
+</html>
