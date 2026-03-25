@@ -1,14 +1,35 @@
-# Raspberry Pi POS System Requirements
-# Fixed for Python 3.13 and Debian trixie
+# Smart Trolley POS System Requirements
+# Target: Raspberry Pi 4B (ARM64, Raspberry Pi OS / Debian)
+# Dev: install non-Pi packages only (skip RPi.GPIO, picamera2 on x86)
+
+# --- Pi hardware ---
 RPi.GPIO>=0.7.1
 spidev>=3.5
-Adafruit-GPIO==1.0.3
-Adafruit-SSD1306>=1.6.0
 hx711>=0.0.4
+picamera2>=0.3.12
+
+# --- Display ---
+luma.lcd>=2.4.0
 Pillow>=9.0.0
-pyserial>=3.5
-requests>=2.28.0
+
+# --- Barcode scanning ---
+pyzbar>=0.1.9
+
+# --- Database ---
+psycopg2-binary>=2.9.0
+python-dotenv>=1.0.0
+
+# --- Payment / QR ---
 qrcode[pil]>=7.4.0
-numpy>=1.21.0
-Flask>=2.0.0
 razorpay>=2.0.0
+
+# --- Receipt printing ---
+python-escpos>=3.0.0
+
+# --- Web / API (Flask prototype) ---
+Flask>=2.0.0
+requests>=2.28.0
+
+# --- Misc ---
+numpy>=1.21.0
+pyserial>=3.5
