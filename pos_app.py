@@ -191,6 +191,11 @@ def add_to_cart():
                     cart_total=cart_total,
                     cart_count=len(shopping_cart),
                 )
+                # After 2 s — switch to full cart list view
+                _cart_snap = shopping_cart[:]
+                display._schedule(
+                    2.0, display.show_cart_list, _cart_snap, cart_total
+                )
         except Exception as _disp_err:
             logger.warning("TFT display update skipped: %s", _disp_err)
 
@@ -220,13 +225,39 @@ def get_cart():
 def remove_from_cart():
     global shopping_cart
     try:
-        product_id    = request.get_json().get("product_id")
+        data       = request.get_json()
+        product_id = data.get("product_id")
+
+        # Capture removed item name before deletion
+        removed = next((i for i in shopping_cart if i["id"] == product_id), None)
+        removed_name = removed["name"] if removed else str(product_id)
+
         shopping_cart = [i for i in shopping_cart if i["id"] != product_id]
+        cart_total    = calculate_cart_total()
+
+        # ── Update TFT display ────────────────────────────────────────────
+        try:
+            display.show_product_removed(
+                name=removed_name,
+                cart_total=cart_total,
+                cart_count=len(shopping_cart),
+            )
+            # After 2 s — switch to updated cart list
+            if shopping_cart:
+                _cart_snap = shopping_cart[:]
+                display._schedule(
+                    2.0, display.show_cart_list, _cart_snap, cart_total
+                )
+            else:
+                display._schedule(2.0, display.show_cart_cleared)
+        except Exception as _disp_err:
+            logger.warning("TFT display update skipped: %s", _disp_err)
+
         return jsonify({
             "success":    True,
             "cart":       shopping_cart,
             "cart_count": len(shopping_cart),
-            "cart_total": calculate_cart_total()
+            "cart_total": cart_total
         })
     except Exception as e:
         logger.error("Error removing from cart: %s", e)
@@ -270,9 +301,16 @@ def create_payment_order():
         qr = qrcode.QRCode(version=1, box_size=10, border=5)
         qr.add_data(qr_data)
         qr.make(fit=True)
+        qr_pil = qr.make_image(fill_color="black", back_color="white").convert("RGB")
         buf = io.BytesIO()
-        qr.make_image(fill_color="black", back_color="white").save(buf, format="PNG")
+        qr_pil.save(buf, format="PNG")
         qr_b64 = base64.b64encode(buf.getvalue()).decode()
+
+        # ── Show QR on TFT ────────────────────────────────────────────────
+        try:
+            display.show_payment_qr(total=final_total, qr_pil_image=qr_pil)
+        except Exception as _disp_err:
+            logger.warning("TFT QR display skipped: %s", _disp_err)
 
         return jsonify({
             "success":     True,
