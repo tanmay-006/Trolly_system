@@ -20,6 +20,7 @@ import qrcode
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
+import tft_display
 
 # ── Environment ──────────────────────────────────────────────────────────────
 load_dotenv()
@@ -36,6 +37,9 @@ app.secret_key = os.getenv("FLASK_SECRET", "pos-system-secret-key")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ── TFT Display ───────────────────────────────────────────────────────────────
+display = tft_display.TFTDisplay()
 
 # ── Razorpay ──────────────────────────────────────────────────────────────────
 def get_razorpay_client():
@@ -174,11 +178,27 @@ def add_to_cart():
                 "total":    float(product["price"]) * quantity,
             })
 
+        cart_total = calculate_cart_total()
+
+        # ── Update TFT display with last-added product ─────────────────────
+        try:
+            added_item = next((i for i in shopping_cart if i["id"] == barcode), None)
+            if added_item:
+                display.show_product_added(
+                    name=added_item["name"],
+                    price=added_item["price"],
+                    qty=added_item["quantity"],
+                    cart_total=cart_total,
+                    cart_count=len(shopping_cart),
+                )
+        except Exception as _disp_err:
+            logger.warning("TFT display update skipped: %s", _disp_err)
+
         return jsonify({
             "success":    True,
             "cart":       shopping_cart,
             "cart_count": len(shopping_cart),
-            "cart_total": calculate_cart_total()
+            "cart_total": cart_total
         })
 
     except Exception as e:
@@ -217,6 +237,10 @@ def remove_from_cart():
 def clear_cart():
     global shopping_cart
     shopping_cart = []
+    try:
+        display.show_cart_cleared()
+    except Exception as _disp_err:
+        logger.warning("TFT display clear skipped: %s", _disp_err)
     return jsonify({"success": True, "cart": [], "cart_count": 0, "cart_total": 0})
 
 
