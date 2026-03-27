@@ -32,5 +32,12 @@ Status: Not started
 - Neon connection string uses pooling URL (pgbouncer); avoid long-lived connections
 - `.env` is git-ignored; contains DATABASE_URL, UPI_ID, SHOP_NAME, BLUETOOTH_PRINTER_MAC
 
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 260327-001 | Add camera barcode scanner to POS dashboard | 2026-03-27 | pending | [add-camera-scanner](./quick/add-camera-scanner/) |
+
 ---
 *STATE initialized: 2026-03-25*
+*Last activity: 2026-03-27 - Completed quick task 260327-001: Add camera barcode scanner to POS dashboard*

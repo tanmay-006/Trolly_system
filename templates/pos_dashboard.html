@@ -6,6 +6,7 @@
     <title>POS Payment System</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+    <script src="https://unpkg.com/html5-qrcode"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
         .product-card {
@@ -83,7 +84,12 @@
                                 class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition">
                             <i class="fas fa-search mr-2"></i>Scan
                         </button>
+                        <button onclick="toggleCameraScanner()" id="cameraBtn" title="Scan with Camera"
+                                class="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition flex items-center justify-center">
+                            <i class="fas fa-camera"></i>
+                        </button>
                     </div>
+                    <div id="qr-reader" class="mt-4 w-full hidden border-2 border-dashed border-gray-300 rounded-lg overflow-hidden bg-gray-50"></div>
                     <div id="scanResult" class="mt-4 hidden"></div>
                 </div>
 
@@ -219,6 +225,8 @@
         // Global variables
         let cart = [];
         let currentOrder = null;
+        let html5QrcodeScanner = null;
+        let isScanningCamera = false;
 
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
@@ -301,8 +309,8 @@
         }
 
         // Scan product
-        async function scanProduct() {
-            const productId = document.getElementById('scanInput').value.trim();
+        async function scanProduct(forceProductId = null) {
+            const productId = forceProductId || document.getElementById('scanInput').value.trim();
             const quantity = parseInt(document.getElementById('quantityInput').value) || 1;
             const resultDiv = document.getElementById('scanResult');
             
@@ -634,6 +642,54 @@
             setTimeout(() => {
                 notification.remove();
             }, 3000);
+        }
+
+        // Camera Scanner Logic
+        function toggleCameraScanner() {
+            const qrReader = document.getElementById('qr-reader');
+            const cameraBtn = document.getElementById('cameraBtn');
+            
+            if (isScanningCamera) {
+                // Stop scanning
+                if (html5QrcodeScanner) {
+                    html5QrcodeScanner.clear();
+                }
+                qrReader.classList.add('hidden');
+                cameraBtn.innerHTML = '<i class="fas fa-camera"></i>';
+                cameraBtn.classList.remove('bg-red-600', 'hover:bg-red-700');
+                cameraBtn.classList.add('bg-green-600', 'hover:bg-green-700');
+                isScanningCamera = false;
+            } else {
+                // Start scanning
+                qrReader.classList.remove('hidden');
+                cameraBtn.innerHTML = '<i class="fas fa-times"></i>';
+                cameraBtn.classList.remove('bg-green-600', 'hover:bg-green-700');
+                cameraBtn.classList.add('bg-red-600', 'hover:bg-red-700');
+                
+                html5QrcodeScanner = new Html5QrcodeScanner(
+                    "qr-reader", 
+                    { fps: 10, qrbox: {width: 250, height: 250} },
+                    /* verbose= */ false
+                );
+                
+                html5QrcodeScanner.render(onScanSuccess, onScanFailure);
+                isScanningCamera = true;
+            }
+        }
+
+        function onScanSuccess(decodedText, decodedResult) {
+            // Stop scanning after success to prevent multiple rapid scans
+            if (html5QrcodeScanner && isScanningCamera) {
+                toggleCameraScanner();
+            }
+            
+            // Auto fill the input and scan
+            document.getElementById('scanInput').value = decodedText;
+            scanProduct(decodedText);
+        }
+
+        function onScanFailure(error) {
+            // Ignore ongoing generic failures 
         }
     </script>
 </body>
