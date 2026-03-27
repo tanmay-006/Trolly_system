@@ -160,6 +160,89 @@ class TFTDisplay:
         draw.text((30, 102), "\u2022 Ready \u2022",         font=_load_font(11), fill=GREEN)
         self._render(img)
 
+    def show_idle_scan(self, item_count: int = 0, subtotal: float = 0.0) -> None:
+        """Idle screen for scan mode with optional cart summary footer."""
+        if not _LUMA_AVAILABLE:
+            logger.info("[TFT IDLE] items=%d subtotal=₹%.2f", item_count, subtotal)
+            return
+        if not self._device:
+            return
+        try:
+            img, draw = self._blank()
+            draw.text((22, 20), "SMART", font=_load_font(22), fill=WHITE)
+            draw.text((22, 48), "TROLLEY", font=_load_font(22), fill=YELLOW)
+            draw.line([(0, 78), (WIDTH, 78)], fill=GREY, width=1)
+            draw.text((14, 84), "Scan your items", font=_load_font(11, bold=False), fill=CYAN)
+            if item_count > 0:
+                draw.text((6, 104), f"Items: {item_count}", font=_load_font(10, bold=False), fill=LT_GREY)
+                draw.text((78, 102), f"₹{subtotal:.2f}", font=_load_font(12), fill=YELLOW)
+            else:
+                draw.text((30, 102), "\u2022 Ready \u2022", font=_load_font(11), fill=GREEN)
+            self._render(img)
+        except Exception as exc:
+            logger.error("TFT show_idle_scan: %s", exc)
+
+    def show_scan_product_card(
+        self,
+        name: str,
+        price: float,
+        expected_weight_g: float | int | None,
+        measured_weight_g: float | int | None,
+        cart_count: int,
+        cart_subtotal: float,
+    ) -> None:
+        """Render a scan result card with weight and cart summary."""
+        if not _LUMA_AVAILABLE:
+            logger.info(
+                "[TFT SCAN] %s ₹%.2f exp=%sg got=%sg items=%d subtotal=₹%.2f",
+                name,
+                price,
+                expected_weight_g,
+                measured_weight_g,
+                cart_count,
+                cart_subtotal,
+            )
+            return
+        if not self._device:
+            return
+        try:
+            img, draw = self._blank()
+            self._header(draw, "SCAN OK", "#003b2f", GREEN, 13)
+
+            short = self._truncate(name, _load_font(13), WIDTH - 10)
+            draw.text((6, 28), short, font=_load_font(13), fill=WHITE)
+            draw.text((6, 45), f"₹{price:.2f}", font=_load_font(14), fill=YELLOW)
+
+            exp = "-" if expected_weight_g is None else str(int(expected_weight_g))
+            got = "-" if measured_weight_g is None else str(int(measured_weight_g))
+            draw.text((6, 64), f"Exp: {exp} g", font=_load_font(10, bold=False), fill=LT_GREY)
+            draw.text((82, 64), f"Now: {got} g", font=_load_font(10, bold=False), fill=CYAN)
+
+            draw.line([(0, 88), (WIDTH, 88)], fill=GREY, width=1)
+            draw.text((6, 94), f"Items: {cart_count}", font=_load_font(10, bold=False), fill=LT_GREY)
+            draw.text((78, 92), f"₹{cart_subtotal:.2f}", font=_load_font(13), fill=YELLOW)
+            self._render(img)
+        except Exception as exc:
+            logger.error("TFT show_scan_product_card: %s", exc)
+
+    def show_product_not_found(self, barcode: str) -> None:
+        """Render a temporary not-found card for unknown barcodes."""
+        if not _LUMA_AVAILABLE:
+            logger.info("[TFT MISS] barcode=%s", barcode)
+            return
+        if not self._device:
+            return
+        try:
+            img, draw = self._blank()
+            self._header(draw, "NOT FOUND", DK_RED, RED, 14)
+            draw.text((6, 36), "Product not found", font=_load_font(12), fill=WHITE)
+            short_code = self._truncate(barcode, _load_font(11, bold=False), WIDTH - 10)
+            draw.text((6, 56), short_code, font=_load_font(11, bold=False), fill=LT_GREY)
+            draw.text((6, 94), "Try scanning again", font=_load_font(10, bold=False), fill=ORANGE)
+            self._render(img)
+        except Exception as exc:
+            logger.error("TFT show_product_not_found: %s", exc)
+
     # ─────────────────────────────────────────────────────────────────────────
     # Product Added
     # ─────────────────────────────────────────────────────────────────────────

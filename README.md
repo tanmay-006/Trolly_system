@@ -169,6 +169,19 @@ source .venv/bin/activate
 python pos_app.py
 ```
 
+### 6a. Run Phase 2 Pi runtime (idle + scan + display)
+
+```bash
+source .venv/bin/activate
+python main.py
+```
+
+Notes:
+- Requires `DATABASE_URL` in `.env`.
+- Uses camera barcode scanning when `picamera2` + `pyzbar` are available.
+- Falls back to terminal input if camera libraries are not available.
+- Reads HX711 after each scan when the sensor library and wiring are available.
+
 ### 7. Auto-start on boot (systemd)
 
 Create the service file:

@@ -2,11 +2,14 @@
 # Target: Raspberry Pi 4B (ARM64, Raspberry Pi OS / Debian)
 # Dev: install non-Pi packages only (skip RPi.GPIO, picamera2 on x86)
 
+# --- System packages required (install via apt, not pip) ---
+# sudo apt install -y python3-picamera2 python3-libcamera
+# These packages cannot be pip-installed as they depend on system-only libcamera libraries
+
 # --- Pi hardware ---
 RPi.GPIO>=0.7.1
 spidev>=3.5
 hx711>=0.0.4
-picamera2>=0.3.12
 
 # --- Display ---
 luma.lcd>=2.4.0

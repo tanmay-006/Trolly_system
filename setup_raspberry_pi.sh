@@ -1,23 +1,39 @@
 #!/bin/bash
 
-# Raspberry Pi POS Setup Script
-echo "Setting up Raspberry Pi POS System..."
+# Smart Trolley System Setup Script for Raspberry Pi
+echo "Setting up Smart Trolley System on Raspberry Pi..."
+
+# Detect current directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+echo "Working directory: $SCRIPT_DIR"
 
 # Update system
 echo "Updating system packages..."
-sudo apt-get update
-sudo apt-get upgrade -y
-
-# Install Python dependencies
-echo "Installing Python dependencies..."
-pip3 install -r requirements_pi.txt
+sudo apt update
+sudo apt upgrade -y
 
 # Install system dependencies
 echo "Installing system dependencies..."
-sudo apt-get install -y python3-dev python3-pip python3-setuptools
-sudo apt-get install -y build-essential libssl-dev libffi-dev
-sudo apt-get install -y bluetooth bluez libbluetooth-dev libudev-dev
-sudo apt-get install -y i2c-tools spi-tools
+sudo apt install -y python3-dev python3-pip python3-setuptools python3-venv
+sudo apt install -y build-essential libssl-dev libffi-dev
+sudo apt install -y bluetooth bluez libbluetooth-dev libudev-dev
+sudo apt install -y i2c-tools spi-tools
+
+# Install Pi-specific system packages (cannot be pip-installed)
+echo "Installing Raspberry Pi camera system packages..."
+sudo apt install -y python3-picamera2 python3-libcamera libcamera-dev
+
+# Verify libcamera installation
+echo "Verifying libcamera installation..."
+if python3 -c "import libcamera; print('libcamera OK')" 2>/dev/null; then
+    echo "✓ libcamera installed successfully"
+else
+    echo "⚠ WARNING: libcamera import failed. This may be a known issue with Debian Trixie."
+    echo "  The system will fall back to stdin barcode input."
+    echo "  Camera functionality may require OS downgrade to Bookworm or system updates."
+fi
 
 # Enable SPI and I2C
 echo "Enabling SPI and I2C interfaces..."
@@ -30,52 +46,42 @@ sudo usermod -a -G gpio $USER
 sudo usermod -a -G spi $USER
 sudo usermod -a -G i2c $USER
 
-# Create systemd service for auto-start
-echo "Creating systemd service..."
-sudo tee /etc/systemd/system/raspberry-pi-pos.service > /dev/null <<EOF
-[Unit]
-Description=Raspberry Pi POS System
-After=network.target
+# Create virtual environment with system-site-packages enabled
+echo "Creating Python virtual environment..."
+if [ -d ".venv" ]; then
+    echo "Removing existing .venv..."
+    rm -rf .venv
+fi
+python3 -m venv --system-site-packages .venv
 
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/home/pi/raspberry-paymentsystem
-ExecStart=/usr/bin/python3 /home/pi/raspberry-paymentsystem/raspberry_pi_pos.py
-Restart=always
-RestartSec=10
+# Install Python dependencies
+echo "Installing Python dependencies..."
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements_pi.txt
 
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Enable service
-sudo systemctl daemon-reload
-sudo systemctl enable raspberry-pi-pos.service
+# Verify critical imports
+echo "Verifying Python package imports..."
+python3 -c "import psycopg2; print('✓ psycopg2')" || echo "✗ psycopg2 FAILED"
+python3 -c "import pyzbar; print('✓ pyzbar')" || echo "✗ pyzbar FAILED"
+python3 -c "from luma.lcd.device import st7735; print('✓ luma.lcd')" || echo "✗ luma.lcd FAILED"
+python3 -c "from picamera2 import Picamera2; print('✓ picamera2')" 2>/dev/null || echo "⚠ picamera2 (fallback to stdin)"
+python3 -c "from hx711 import HX711; print('✓ hx711')" || echo "✗ hx711 FAILED"
 
 # Setup Bluetooth printer
-echo "Setting up Bluetooth printer..."
+echo "Setting up Bluetooth..."
 sudo systemctl enable bluetooth
 sudo systemctl start bluetooth
 
-# Create desktop shortcut
-echo "Creating desktop shortcut..."
-mkdir -p /home/pi/Desktop
-cat > /home/pi/Desktop/POS_System.desktop <<EOF
-[Desktop Entry]
-Name=POS System
-Comment=Raspberry Pi POS System
-Exec=python3 /home/pi/raspberry-paymentsystem/raspberry_pi_pos.py
-Icon=terminal
-Terminal=true
-Type=Application
-Categories=Office;
-EOF
-
-chmod +x /home/pi/Desktop/POS_System.desktop
-
-echo "Setup complete! Please reboot your Raspberry Pi."
-echo "After reboot, you can:"
-echo "1. Run 'python3 raspberry_pi_pos.py' to start the POS system"
-echo "2. Use the desktop shortcut to start the POS system"
-echo "3. The service will auto-start on boot"
+echo ""
+echo "========================================"
+echo "Setup complete!"
+echo "========================================"
+echo ""
+echo "Next steps:"
+echo "1. Create a .env file with your DATABASE_URL and other secrets"
+echo "2. Activate the virtual environment: source .venv/bin/activate"
+echo "3. Run the Pi runtime: python main.py"
+echo ""
+echo "Note: If camera import failed, the system will use stdin for barcode input."
+echo ""

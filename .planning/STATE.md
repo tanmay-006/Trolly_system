@@ -37,6 +37,7 @@ Status: Not started
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 260327-001 | Add camera barcode scanner to POS dashboard | 2026-03-27 | pending | [add-camera-scanner](./quick/add-camera-scanner/) |
+| 260327-002 | Implement Phase 2 Pi runtime (idle, scan, display) | 2026-03-27 | pending | [phase2-pi-runtime-idle-scan-display](./quick/phase2-pi-runtime-idle-scan-display/) |
 
 ---
 *STATE initialized: 2026-03-25*
