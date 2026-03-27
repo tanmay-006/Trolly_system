@@ -1,54 +1,31 @@
 #!/usr/bin/env python3
 """
-Smart Trolley Point of Sale System
-Complete POS flow: Scan → Cart → Total → QR Code → Receipt
-Products served from Neon PostgreSQL via psycopg2.
+Smart Trolley Admin Panel
+Admin web interface for product and transaction management.
+Customer-facing UI has been moved to the Pi runtime (main.py + TFT display).
 """
 
 import os
-import json
-import io
-import base64
-import uuid
 import logging
 from datetime import datetime
 from contextlib import contextmanager
 
 from flask import Flask, render_template, request, jsonify, redirect
-import razorpay
-import qrcode
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
-import tft_display
 
 # ── Environment ──────────────────────────────────────────────────────────────
 load_dotenv()
 
 DATABASE_URL = os.environ["DATABASE_URL"]
-UPI_ID       = os.getenv("UPI_ID", "yourshop@upi")
-SHOP_NAME    = os.getenv("SHOP_NAME", "Smart Trolley Shop")
-RZP_KEY_ID   = os.getenv("RAZORPAY_KEY_ID", "")
-RZP_SECRET   = os.getenv("RAZORPAY_KEY_SECRET", "")
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET", "pos-system-secret-key")
+app.secret_key = os.getenv("FLASK_SECRET", "pos-admin-secret-key")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# ── TFT Display ───────────────────────────────────────────────────────────────
-display = tft_display.TFTDisplay()
-
-# ── Razorpay ──────────────────────────────────────────────────────────────────
-def get_razorpay_client():
-    client = razorpay.Client(auth=(RZP_KEY_ID, RZP_SECRET))
-    client.enable_retry(True)
-    client.set_app_details({"title": "POS Payment System", "version": "1.0.0"})
-    return client
-
-razorpay_client = get_razorpay_client()
 
 # ── Database ──────────────────────────────────────────────────────────────────
 @contextmanager
@@ -95,317 +72,40 @@ def save_transaction(session_id: str, items: list, total: float,
             return cur.fetchone()["id"]
 
 
-# ── In-memory cart (per Flask process / session) ──────────────────────────────
-shopping_cart: list[dict] = []
-
-
-def calculate_cart_total() -> float:
-    return sum(item["total"] for item in shopping_cart)
-
-
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
-def pos_dashboard():
-    """Main POS dashboard — pass product list from DB for the sidebar."""
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT barcode, name, price, category FROM products ORDER BY category, name")
-            products = {row["barcode"]: dict(row) for row in cur.fetchall()}
-    return render_template("pos_dashboard.html", products=products)
-
-
-@app.route("/api/scan_product", methods=["POST"])
-def scan_product():
-    """Scan product by barcode — looks up Neon instead of hardcoded dict."""
-    try:
-        data = request.get_json()
-        barcode = str(data.get("product_id", "")).strip()
-
-        product = get_product_by_barcode(barcode)
-        if not product:
-            return jsonify({
-                "success": False,
-                "error": "Product not found",
-                "message": f"No product with barcode {barcode!r} in database"
-            }), 404
-
-        return jsonify({
-            "success": True,
-            "product": {
-                "id":              product["barcode"],
-                "name":            product["name"],
-                "price":           float(product["price"]),
-                "category":        product.get("category", ""),
-                "expected_weight": product.get("weight_grams", 0),
-                "quantity":        1,
-                "total":           float(product["price"]),
-            },
-            "message": f'Product {product["name"]} scanned successfully'
-        })
-
-    except Exception as e:
-        logger.error("Error scanning product: %s", e)
-        return jsonify({"success": False, "error": str(e)}), 400
-
-
-@app.route("/api/add_to_cart", methods=["POST"])
-def add_to_cart():
-    """Add product to shopping cart (in-memory)."""
-    global shopping_cart
-    try:
-        data = request.get_json()
-        barcode  = str(data.get("product_id", "")).strip()
-        quantity = int(data.get("quantity", 1))
-
-        product = get_product_by_barcode(barcode)
-        if not product:
-            return jsonify({"success": False, "error": "Product not found"}), 404
-
-        for item in shopping_cart:
-            if item["id"] == barcode:
-                item["quantity"] += quantity
-                item["total"] = item["price"] * item["quantity"]
-                break
-        else:
-            shopping_cart.append({
-                "id":       barcode,
-                "name":     product["name"],
-                "price":    float(product["price"]),
-                "category": product.get("category", ""),
-                "expected_weight": product.get("weight_grams", 0),
-                "quantity": quantity,
-                "total":    float(product["price"]) * quantity,
-            })
-
-        cart_total = calculate_cart_total()
-
-        # ── Update TFT display with last-added product ─────────────────────
-        try:
-            added_item = next((i for i in shopping_cart if i["id"] == barcode), None)
-            if added_item:
-                display.show_product_added(
-                    name=added_item["name"],
-                    price=added_item["price"],
-                    qty=added_item["quantity"],
-                    cart_total=cart_total,
-                    cart_count=len(shopping_cart),
-                )
-                # After 2 s — switch to full cart list view
-                _cart_snap = shopping_cart[:]
-                display._schedule(
-                    2.0, display.show_cart_list, _cart_snap, cart_total
-                )
-        except Exception as _disp_err:
-            logger.warning("TFT display update skipped: %s", _disp_err)
-
-        return jsonify({
-            "success":    True,
-            "cart":       shopping_cart,
-            "cart_count": len(shopping_cart),
-            "cart_total": cart_total
-        })
-
-    except Exception as e:
-        logger.error("Error adding to cart: %s", e)
-        return jsonify({"success": False, "error": str(e)}), 400
-
-
-@app.route("/api/get_cart")
-def get_cart():
-    return jsonify({
-        "success":    True,
-        "cart":       shopping_cart,
-        "cart_count": len(shopping_cart),
-        "cart_total": calculate_cart_total()
-    })
-
-
-@app.route("/api/remove_from_cart", methods=["POST"])
-def remove_from_cart():
-    global shopping_cart
-    try:
-        data       = request.get_json()
-        product_id = data.get("product_id")
-
-        # Capture removed item name before deletion
-        removed = next((i for i in shopping_cart if i["id"] == product_id), None)
-        removed_name = removed["name"] if removed else str(product_id)
-
-        shopping_cart = [i for i in shopping_cart if i["id"] != product_id]
-        cart_total    = calculate_cart_total()
-
-        # ── Update TFT display ────────────────────────────────────────────
-        try:
-            display.show_product_removed(
-                name=removed_name,
-                cart_total=cart_total,
-                cart_count=len(shopping_cart),
-            )
-            # After 2 s — switch to updated cart list
-            if shopping_cart:
-                _cart_snap = shopping_cart[:]
-                display._schedule(
-                    2.0, display.show_cart_list, _cart_snap, cart_total
-                )
-            else:
-                display._schedule(2.0, display.show_cart_cleared)
-        except Exception as _disp_err:
-            logger.warning("TFT display update skipped: %s", _disp_err)
-
-        return jsonify({
-            "success":    True,
-            "cart":       shopping_cart,
-            "cart_count": len(shopping_cart),
-            "cart_total": cart_total
-        })
-    except Exception as e:
-        logger.error("Error removing from cart: %s", e)
-        return jsonify({"success": False, "error": str(e)}), 400
-
-
-@app.route("/api/clear_cart", methods=["POST"])
-def clear_cart():
-    global shopping_cart
-    shopping_cart = []
-    try:
-        display.show_cart_cleared()
-    except Exception as _disp_err:
-        logger.warning("TFT display clear skipped: %s", _disp_err)
-    return jsonify({"success": True, "cart": [], "cart_count": 0, "cart_total": 0})
-
-
-@app.route("/api/create_payment_order", methods=["POST"])
-def create_payment_order():
-    """Create Razorpay order and generate UPI QR code."""
-    try:
-        if not shopping_cart:
-            return jsonify({"success": False, "error": "Cart is empty"}), 400
-
-        cart_total  = calculate_cart_total()
-        gst_amount  = cart_total * 0.18
-        final_total = cart_total + gst_amount
-
-        order = razorpay_client.order.create({
-            "amount":          int(final_total * 100),
-            "currency":        "INR",
-            "receipt":         f"pos_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            "payment_capture": 1,
-        })
-
-        # UPI QR (uses env UPI_ID instead of hardcoded test UPI)
-        qr_data = (
-            f"upi://pay?pa={UPI_ID}&pn={SHOP_NAME}"
-            f"&am={final_total:.2f}&cu=INR&tn={order['id']}"
-        )
-        qr = qrcode.QRCode(version=1, box_size=10, border=5)
-        qr.add_data(qr_data)
-        qr.make(fit=True)
-        qr_pil = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-        buf = io.BytesIO()
-        qr_pil.save(buf, format="PNG")
-        qr_b64 = base64.b64encode(buf.getvalue()).decode()
-
-        # ── Show QR on TFT ────────────────────────────────────────────────
-        try:
-            display.show_payment_qr(total=final_total, qr_pil_image=qr_pil)
-        except Exception as _disp_err:
-            logger.warning("TFT QR display skipped: %s", _disp_err)
-
-        return jsonify({
-            "success":     True,
-            "order":       order,
-            "qr_code":     f"data:image/png;base64,{qr_b64}",
-            "cart_total":  cart_total,
-            "gst_amount":  gst_amount,
-            "final_total": final_total,
-            "cart_items":  shopping_cart,
-            "message":     "Payment QR code generated successfully"
-        })
-
-    except Exception as e:
-        logger.error("Error creating payment order: %s", e)
-        return jsonify({"success": False, "error": str(e)}), 400
-
-
-@app.route("/api/complete_payment", methods=["POST"])
-def complete_payment():
-    """Mark payment as done and persist transaction to Neon."""
-    global shopping_cart
-    try:
-        if not shopping_cart:
-            return jsonify({"success": False, "error": "Cart is empty"}), 400
-
-        data       = request.get_json()
-        order_id   = data.get("order_id", "")
-        payment_id = data.get("payment_id", f"pay_demo_{uuid.uuid4().hex[:8]}")
-        cart_total = calculate_cart_total()
-        final_total = cart_total * 1.18
-        session_id  = f"SESSION_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-
-        # Persist to Neon
-        tx_id = save_transaction(
-            session_id=session_id,
-            items=shopping_cart.copy(),
-            total=final_total,
-            status="paid",
-            payment_method="UPI/QR",
-            upi_ref=payment_id,
-        )
-        logger.info("Transaction saved to DB: id=%s session=%s", tx_id, session_id)
-
-        receipt = {
-            "receipt_id":     session_id,
-            "db_transaction": tx_id,
-            "order_id":       order_id,
-            "payment_id":     payment_id,
-            "date":           datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "items":          shopping_cart.copy(),
-            "subtotal":       cart_total,
-            "tax":            cart_total * 0.18,
-            "total":          final_total,
-            "payment_method": "UPI/QR Code",
-            "status":         "PAID",
-        }
-
-        shopping_cart = []
-
-        # ── Update TFT display — payment confirmed ─────────────────────────
-        try:
-            display.show_payment_success(total=final_total, receipt_id=session_id)
-            # Return to idle/splash after 5 seconds (non-blocking)
-            import threading
-            threading.Timer(
-                5.0, lambda: display.show_cart_cleared()
-            ).start()
-        except Exception as _disp_err:
-            logger.warning("TFT payment display skipped: %s", _disp_err)
-
-        return jsonify({"success": True, "receipt": receipt,
-                        "message": "Payment completed successfully"})
-
-    except Exception as e:
-        logger.error("Error completing payment: %s", e)
-        return jsonify({"success": False, "error": str(e)}), 400
-
-
-@app.route("/receipt/<receipt_id>")
-def view_receipt(receipt_id):
-    return render_template("receipt.html", receipt_id=receipt_id)
+def index():
+    """Redirect root to admin panel."""
+    return redirect("/admin")
 
 
 # ── Admin Panel ───────────────────────────────────────────────────────────────
 
 @app.route("/admin")
 def admin_panel():
-    """Admin panel — list all products."""
+    """Admin panel — list all products and transactions."""
     with get_db() as conn:
         with conn.cursor() as cur:
+            # Get products
             cur.execute(
                 "SELECT * FROM products ORDER BY category, name"
             )
             products = [dict(r) for r in cur.fetchall()]
-    return render_template("admin.html", products=products)
+
+            # Get recent transactions
+            cur.execute(
+                """
+                SELECT id, session_id, total_amount, payment_status,
+                       payment_method, created_at
+                FROM transactions
+                ORDER BY created_at DESC
+                LIMIT 50
+                """
+            )
+            transactions = [dict(r) for r in cur.fetchall()]
+
+    return render_template("admin.html", products=products, transactions=transactions)
 
 
 @app.route("/admin/add", methods=["POST"])
@@ -460,16 +160,6 @@ def admin_delete_product(barcode: str):
         return jsonify({"success": False, "error": str(e)}), 400
 
 
-@app.route("/api/admin/products")
-def api_admin_products():
-    """JSON list of all products — used by the POS dashboard to refresh the grid."""
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT barcode, name, price, category, stock FROM products ORDER BY category, name")
-            products = {r["barcode"]: dict(r) for r in cur.fetchall()}
-    return jsonify({"success": True, "products": products})
-
-
 @app.route("/health")
 def health_check():
     """Health check — also verifies DB connectivity."""
@@ -478,24 +168,30 @@ def health_check():
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) AS cnt FROM products")
                 product_count = cur.fetchone()["cnt"]
+                cur.execute("SELECT COUNT(*) AS cnt FROM transactions")
+                transaction_count = cur.fetchone()["cnt"]
         db_status = "ok"
     except Exception as e:
         db_status = f"error: {e}"
         product_count = None
+        transaction_count = None
 
     return jsonify({
-        "status":         "healthy" if db_status == "ok" else "degraded",
-        "timestamp":      datetime.now().isoformat(),
-        "service":        "Smart Trolley POS",
-        "database":       db_status,
-        "product_count":  product_count,
+        "status":             "healthy" if db_status == "ok" else "degraded",
+        "timestamp":          datetime.now().isoformat(),
+        "service":            "Smart Trolley Admin Panel",
+        "database":           db_status,
+        "product_count":      product_count,
+        "transaction_count":  transaction_count,
     })
 
 
 if __name__ == "__main__":
     os.makedirs("templates", exist_ok=True)
     os.makedirs("static", exist_ok=True)
-    print("Starting Smart Trolley POS...")
-    print(f"Dashboard:    http://0.0.0.0:5000")
+    print("Starting Smart Trolley Admin Panel...")
+    print(f"Admin Panel:  http://0.0.0.0:5000/admin")
     print(f"Health check: http://0.0.0.0:5000/health")
+    print("\nNote: Customer-facing UI is on the Pi runtime (main.py + TFT display)")
     app.run(host="0.0.0.0", port=5000, debug=True)
+
