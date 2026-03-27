@@ -185,12 +185,65 @@ class TFTDisplay:
         except Exception as exc:
             logger.error("TFT show_product_added failed: %s", exc)
 
+    def show_payment_success(self, total: float, receipt_id: str = ""):
+        """
+        Show payment confirmed screen.
+
+        Layout (160×128):
+          ┌────────────────────┐
+          │  PAYMENT SUCCESS   │  ← green header
+          │                    │
+          │   ✓ PAID           │  ← large green tick
+          │   ₹<total>         │  ← amount in white
+          │ ─────────────────  │
+          │ Thank you!         │  ← yellow
+          │ <receipt_id>       │  ← grey, small
+          └────────────────────┘
+        """
+        if not _LUMA_AVAILABLE:
+            logger.info("[TFT] Payment success — ₹%.2f  receipt=%s", total, receipt_id)
+            return
+
+        if not self._device:
+            return
+
+        try:
+            img, draw = self._blank()
+
+            # ── Header ────────────────────────────────────────────────────────
+            draw.rectangle([(0, 0), (WIDTH, 22)], fill="#1b5e20")
+            draw.text((6, 4), "PAYMENT SUCCESS", font=_load_font(13), fill=GREEN)
+
+            # ── Big tick ──────────────────────────────────────────────────────
+            draw.text((18, 28), "\u2714", font=_load_font(36), fill=GREEN)
+
+            # ── Amount ────────────────────────────────────────────────────────
+            draw.text((72, 35), "PAID", font=_load_font(13), fill=WHITE)
+            draw.text((72, 53), f"\u20b9{total:.2f}", font=_load_font(15), fill=WHITE)
+
+            # ── Divider ───────────────────────────────────────────────────────
+            draw.line([(0, 80), (WIDTH, 80)], fill=GREY, width=1)
+
+            # ── Thank you ─────────────────────────────────────────────────────
+            draw.text((18, 87), "Thank you!", font=_load_font(15), fill=YELLOW)
+
+            # ── Receipt ID (small, truncated) ─────────────────────────────────
+            if receipt_id:
+                short_id = self._truncate(receipt_id, _load_font(10), WIDTH - 10)
+                draw.text((6, 112), short_id, font=_load_font(10), fill=GREY)
+
+            self._render(img)
+
+        except Exception as exc:
+            logger.error("TFT show_payment_success failed: %s", exc)
+
     def show_cart_cleared(self):
         """Show idle/cleared screen after cart is cleared or payment done."""
         if not _LUMA_AVAILABLE:
             logger.info("[TFT] Cart cleared — showing idle screen")
             return
         self._show_splash()
+
 
     def show_error(self, message: str):
         """Show a brief error message on the display."""

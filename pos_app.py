@@ -331,6 +331,18 @@ def complete_payment():
         }
 
         shopping_cart = []
+
+        # ── Update TFT display — payment confirmed ─────────────────────────
+        try:
+            display.show_payment_success(total=final_total, receipt_id=session_id)
+            # Return to idle/splash after 5 seconds (non-blocking)
+            import threading
+            threading.Timer(
+                5.0, lambda: display.show_cart_cleared()
+            ).start()
+        except Exception as _disp_err:
+            logger.warning("TFT payment display skipped: %s", _disp_err)
+
         return jsonify({"success": True, "receipt": receipt,
                         "message": "Payment completed successfully"})
 
