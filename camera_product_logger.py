@@ -87,7 +87,8 @@ TFT_BUS_SPEED_HZ = int(os.getenv("TFT_BUS_SPEED_HZ", "4000000"))
 TFT_CLEANUP_ON_EXIT = os.getenv("TFT_CLEANUP_ON_EXIT", "0").strip().lower() in {
     "1", "true", "yes"
 }
-TFT_REINIT_SECONDS = float(os.getenv("TFT_REINIT_SECONDS", "12"))
+# 0 disables periodic reinit; on-demand reinit still happens on render failure.
+TFT_REINIT_SECONDS = float(os.getenv("TFT_REINIT_SECONDS", "0"))
 
 
 def _call_with_timeout(fn, timeout_seconds: float, name: str) -> bool:
@@ -563,7 +564,7 @@ def main() -> int:
                 display.show_waiting()
                 waiting_refresh_at = time.monotonic()
 
-            if display and time.monotonic() - tft_reinit_at > TFT_REINIT_SECONDS:
+            if display and TFT_REINIT_SECONDS > 0 and (time.monotonic() - tft_reinit_at) > TFT_REINIT_SECONDS:
                 if display.force_reinit():
                     logger.info("Periodic TFT re-init completed")
                     display.show_waiting()

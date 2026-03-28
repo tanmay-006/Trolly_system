@@ -20,5 +20,6 @@ rm -f /tmp/camera_product_logger.lock
 # Conservative SPI speed is often more stable after repeated restarts.
 export TFT_BUS_SPEED_HZ="${TFT_BUS_SPEED_HZ:-4000000}"
 export CAMERA_LOGGER_AUTO_TAKEOVER="${CAMERA_LOGGER_AUTO_TAKEOVER:-1}"
+export TFT_REINIT_SECONDS="${TFT_REINIT_SECONDS:-0}"
 
 exec /home/trolley/Trolly_system/.venv/bin/python /home/trolley/Trolly_system/camera_product_logger.py
