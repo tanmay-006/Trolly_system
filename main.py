@@ -112,6 +112,44 @@ TFT_REINIT_SECONDS = float(os.getenv("TFT_REINIT_SECONDS", "25"))
 TFT_CLEANUP_ON_EXIT = os.getenv("TFT_CLEANUP_ON_EXIT", "0").strip().lower() in {
     "1", "true", "yes"
 }
+SCANNER_BUTTON_ENABLED = os.getenv("SCANNER_BUTTON_ENABLED", "1").strip().lower() in {
+    "1", "true", "yes"
+}
+SCANNER_BUTTON_PIN_MODE = os.getenv("SCANNER_BUTTON_PIN_MODE", "board").strip().lower()
+SCANNER_BUTTON_PIN = int(os.getenv("SCANNER_BUTTON_PIN", "11"))
+SCANNER_BUTTON_BOUNCETIME_MS = int(os.getenv("SCANNER_BUTTON_BOUNCETIME_MS", "250"))
+
+BOARD_TO_BCM_PIN = {
+    3: 2,
+    5: 3,
+    7: 4,
+    8: 14,
+    10: 15,
+    11: 17,
+    12: 18,
+    13: 27,
+    15: 22,
+    16: 23,
+    18: 24,
+    19: 10,
+    21: 9,
+    22: 25,
+    23: 11,
+    24: 8,
+    26: 7,
+    27: 0,
+    28: 1,
+    29: 5,
+    31: 6,
+    32: 12,
+    33: 13,
+    35: 19,
+    36: 16,
+    37: 26,
+    38: 20,
+    40: 21,
+}
+BCM_TO_BOARD_PIN = {v: k for k, v in BOARD_TO_BCM_PIN.items()}
 
 # Special barcode commands
 BARCODE_REMOVE_LAST = "REMOVE_LAST"
@@ -540,14 +578,11 @@ class TFTDisplay:
         return img, draw
 
     def render_screen(self, image: Image.Image, screen_name: str) -> None:
-        """Render a prepared PIL image to TFT with debug prints."""
+        """Render a prepared PIL image to TFT."""
         if image is None:
-            print(f"[TFT DEBUG] render_screen({screen_name}) image is None")
+            logger.warning("Skipping render for %s: image is None", screen_name)
             return
-        print(f"[TFT DEBUG] before render_screen({screen_name})")
-        print(f"[TFT DEBUG] image.size={image.size}")
         self._render(image)
-        print(f"[TFT DEBUG] after render_screen({screen_name})")
 
     def _text_width(self, text: str, font) -> int:
         bbox = font.getbbox(text)
@@ -697,10 +732,7 @@ class TFTDisplay:
             return
         try:
             img = self.compose_idle_screen(camera_ready, unique_items, total_qty, subtotal)
-            print("[TFT DEBUG] about to render idle")
-            print(f"[TFT DEBUG] idle image size={img.size}")
             self.render_screen(img, "idle")
-            print("[TFT DEBUG] idle rendered")
         except Exception as exc:
             logger.error("TFT show_idle: %s", exc)
 
@@ -730,10 +762,7 @@ class TFTDisplay:
                 total_qty,
                 subtotal,
             )
-            print("[TFT DEBUG] about to render product_found")
-            print(f"[TFT DEBUG] product_found image size={img.size}")
             self.render_screen(img, "product_found")
-            print("[TFT DEBUG] product_found rendered")
         except Exception as exc:
             logger.error("TFT show_product_added: %s", exc)
 
@@ -759,10 +788,7 @@ class TFTDisplay:
                 total_qty,
                 subtotal,
             )
-            print("[TFT DEBUG] about to render qty_updated")
-            print(f"[TFT DEBUG] qty_updated image size={img.size}")
             self.render_screen(img, "qty_updated")
-            print("[TFT DEBUG] qty_updated rendered")
         except Exception as exc:
             logger.error("TFT show_qty_updated: %s", exc)
 
@@ -780,10 +806,7 @@ class TFTDisplay:
                 total_qty,
                 subtotal,
             )
-            print("[TFT DEBUG] about to render not_found")
-            print(f"[TFT DEBUG] not_found image size={img.size}")
             self.render_screen(img, "not_found")
-            print("[TFT DEBUG] not_found rendered")
         except Exception as exc:
             logger.error("TFT show_product_not_found: %s", exc)
 
@@ -802,10 +825,7 @@ class TFTDisplay:
                 total_qty,
                 subtotal,
             )
-            print("[TFT DEBUG] about to render item_removed")
-            print(f"[TFT DEBUG] item_removed image size={img.size}")
             self.render_screen(img, "item_removed")
-            print("[TFT DEBUG] item_removed rendered")
         except Exception as exc:
             logger.error("TFT show_item_removed: %s", exc)
 
@@ -1131,6 +1151,120 @@ class TerminalController:
         self._running = False
 
 
+class ScannerButtonController:
+    """GPIO button that forces scanner idle screen when pressed."""
+
+    def __init__(self, command_queue: queue.Queue, on_press=None):
+        self._queue = command_queue
+        self._on_press = on_press
+        self._started = False
+        self._running = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._debounce_seconds = max(0.05, SCANNER_BUTTON_BOUNCETIME_MS / 1000.0)
+        self._last_press_at = 0.0
+        self._actual_pin = SCANNER_BUTTON_PIN
+
+    def start(self) -> None:
+        if not SCANNER_BUTTON_ENABLED:
+            logger.info("Scanner button disabled by SCANNER_BUTTON_ENABLED")
+            return
+        if GPIO is None:
+            logger.warning("RPi.GPIO unavailable; scanner button disabled")
+            return
+        try:
+            current_mode = GPIO.getmode()
+            if current_mode is None:
+                # Keep global mode consistent with TFT/HX711 usage.
+                GPIO.setmode(GPIO.BCM)
+                current_mode = GPIO.BCM
+
+            if current_mode == GPIO.BCM:
+                mode_label = "BCM"
+                if SCANNER_BUTTON_PIN_MODE == "board":
+                    mapped = BOARD_TO_BCM_PIN.get(SCANNER_BUTTON_PIN)
+                    if mapped is None:
+                        raise ValueError(
+                            f"Unsupported board pin {SCANNER_BUTTON_PIN} for BCM mode mapping"
+                        )
+                    self._actual_pin = mapped
+                else:
+                    self._actual_pin = SCANNER_BUTTON_PIN
+            elif current_mode == GPIO.BOARD:
+                mode_label = "BOARD"
+                if SCANNER_BUTTON_PIN_MODE == "bcm":
+                    mapped = BCM_TO_BOARD_PIN.get(SCANNER_BUTTON_PIN)
+                    if mapped is None:
+                        raise ValueError(
+                            f"Unsupported BCM pin {SCANNER_BUTTON_PIN} for BOARD mode mapping"
+                        )
+                    self._actual_pin = mapped
+                else:
+                    self._actual_pin = SCANNER_BUTTON_PIN
+            else:
+                raise RuntimeError(f"Unsupported GPIO mode: {current_mode}")
+
+            GPIO.setup(self._actual_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            self._started = True
+            self._running = True
+            self._thread.start()
+            initial_level = GPIO.input(self._actual_pin)
+            logger.info(
+                "Scanner button ready on %s pin %d (initial=%d)",
+                mode_label,
+                self._actual_pin,
+                initial_level,
+            )
+            if SCANNER_BUTTON_PIN_MODE == "board" and SCANNER_BUTTON_PIN == 11:
+                logger.info("Button wiring: physical pin 11 -> button -> physical pin 39 (GND)")
+        except Exception as exc:
+            logger.warning("Scanner button init failed: %s", exc)
+
+    def _run(self) -> None:
+        if GPIO is None:
+            return
+        try:
+            prev = GPIO.input(self._actual_pin)
+        except Exception:
+            prev = 1
+
+        while self._running:
+            try:
+                cur = GPIO.input(self._actual_pin)
+            except Exception:
+                time.sleep(0.05)
+                continue
+
+            # Active-low button: transition HIGH->LOW means pressed.
+            if prev == 1 and cur == 0:
+                now = time.monotonic()
+                if (now - self._last_press_at) >= self._debounce_seconds:
+                    self._last_press_at = now
+                    try:
+                        logger.info("Scanner button edge detected")
+                        if self._on_press is not None:
+                            self._on_press()
+                        else:
+                            self._queue.put_nowait("button")
+                    except Exception:
+                        pass
+            prev = cur
+            time.sleep(0.02)
+
+    def stop(self) -> None:
+        if not self._started or GPIO is None:
+            return
+        self._running = False
+        try:
+            self._thread.join(timeout=0.5)
+        except Exception:
+            pass
+        try:
+            GPIO.cleanup([self._actual_pin])
+        except Exception:
+            pass
+        self._started = False
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN RUNTIME
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1187,19 +1321,24 @@ def main() -> int:
     # When camera works, commands should be handled via special barcodes
     terminal_queue = queue.Queue()
     terminal_ctrl = None
+    button_ctrl = ScannerButtonController(terminal_queue)
     camera_ready = scanner.is_camera_ready()
+
+    button_ctrl.start()
 
     if not camera_ready:
         # Camera not working, use stdin for barcode input with terminal commands
         print("\n" + "=" * 60)
         print("Camera unavailable - using stdin for barcode input")
         print("Special commands: 'done', 'clear', 'quit'")
+        print("Button: press once for checkout QR, press again for payment done")
         print("=" * 60 + "\n")
     else:
         # Camera working, no terminal controller needed
         print("\n" + "=" * 60)
         print("Camera ready - scanning barcodes with camera")
-        print("To checkout: scan barcode 'done' or press Ctrl+C")
+        print("To checkout: press button once (or scan barcode 'done')")
+        print("To mark payment done: press button again while QR is displayed")
         print("To clear cart: scan barcode 'clear'")
         print("=" * 60 + "\n")
 
@@ -1207,6 +1346,10 @@ def main() -> int:
     last_barcode = ""
     last_seen_at = 0.0
     checkout_triggered = False
+    checkout_busy = False
+    payment_qr_active = False
+    payment_confirm_requested = False
+    payment_context: dict | None = None
     blink_timer = time.time()
     tft_reinit_at = time.monotonic()
 
@@ -1217,6 +1360,114 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
 
+    def _process_pending_commands() -> None:
+        nonlocal running, checkout_triggered, payment_confirm_requested
+        while True:
+            try:
+                cmd = terminal_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if cmd in ("button", "scanner"):
+                if payment_qr_active:
+                    payment_confirm_requested = True
+                    logger.info("Button press: payment confirmation requested")
+                elif checkout_busy:
+                    logger.info("Button press ignored while checkout is preparing")
+                elif cart.unique_item_count > 0:
+                    checkout_triggered = True
+                    logger.info("Button press: checkout requested")
+                else:
+                    logger.info("Button press ignored: cart is empty")
+            elif cmd == "quit":
+                running = False
+
+    def _sleep_with_button_handling(seconds: float) -> None:
+        end_at = time.monotonic() + max(0.0, seconds)
+        while running and time.monotonic() < end_at:
+            _process_pending_commands()
+            time.sleep(0.05)
+
+    def _start_checkout_flow() -> None:
+        nonlocal checkout_triggered, checkout_busy, payment_qr_active, payment_context
+        if checkout_busy or payment_qr_active:
+            return
+        if cart.unique_item_count == 0:
+            checkout_triggered = False
+            return
+
+        checkout_busy = True
+        checkout_triggered = False
+        logger.info("Starting checkout for %d items", cart.unique_item_count)
+        camera_now = scanner.is_camera_ready()
+
+        try:
+            display.show_cart_summary(camera_now, cart)
+            _sleep_with_button_handling(1.5)
+
+            subtotal = cart.subtotal
+            gst = subtotal * 0.18
+            final_total = subtotal + gst
+
+            session_id = f"SESSION_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+            upi_string = f"upi://pay?pa={UPI_ID}&pn={SHOP_NAME}&am={final_total:.2f}&cu=INR&tn={session_id}"
+
+            qr = qrcode.QRCode(version=1, box_size=10, border=2)
+            qr.add_data(upi_string)
+            qr.make(fit=True)
+            qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+
+            display.show_payment_qr(camera_now, final_total, qr_img)
+            payment_qr_active = True
+            payment_context = {
+                "session_id": session_id,
+                "final_total": final_total,
+            }
+
+            logger.info("QR code displayed for ₹%.2f", final_total)
+            logger.info("Press button again to confirm payment")
+        finally:
+            checkout_busy = False
+
+    def _complete_checkout_flow() -> None:
+        nonlocal payment_qr_active, payment_context, payment_confirm_requested, checkout_busy
+        if checkout_busy or not payment_qr_active or not payment_context:
+            payment_confirm_requested = False
+            return
+
+        checkout_busy = True
+        payment_confirm_requested = False
+
+        session_id = str(payment_context["session_id"])
+        final_total = float(payment_context["final_total"])
+        payment_ref = f"UPI_{uuid.uuid4().hex[:8]}"
+
+        try:
+            tx_id = save_transaction(
+                session_id=session_id,
+                items=cart.to_list(),
+                total=final_total,
+                status="paid",
+                payment_method="UPI/QR",
+                upi_ref=payment_ref,
+            )
+            logger.info("Transaction saved: id=%d session=%s", tx_id, session_id)
+
+            camera_now = scanner.is_camera_ready()
+            display.show_payment_success(camera_now, final_total, session_id)
+            printer.print_receipt(session_id, cart, final_total, payment_ref)
+
+            _sleep_with_button_handling(2.0)
+
+            cart.clear()
+            payment_qr_active = False
+            payment_context = None
+
+            display.show_idle(camera_now, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+            logger.info("Checkout complete. Ready for next customer.")
+        finally:
+            checkout_busy = False
+
     # Show initial idle screen
     camera_ready = scanner.is_camera_ready()
     display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
@@ -1226,6 +1477,18 @@ def main() -> int:
     try:
         while running:
             try:
+                _process_pending_commands()
+
+                if checkout_triggered and not payment_qr_active and not checkout_busy:
+                    _start_checkout_flow()
+
+                if payment_confirm_requested and payment_qr_active and not checkout_busy:
+                    _complete_checkout_flow()
+
+                if payment_qr_active:
+                    time.sleep(0.05)
+                    continue
+
             # Camera indicator blink (every 1 second)
                 if time.time() - blink_timer > 1.0:
                     display.toggle_blink()
@@ -1287,7 +1550,7 @@ def main() -> int:
                         logger.info("Decremented %s → qty=%d", name, new_qty)
                         display.show_item_removed(camera_ready, name, new_qty,
                                                  cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                        time.sleep(2.0)
+                        _sleep_with_button_handling(2.0)
                     else:
                         logger.info("No item to decrement")
                     display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
@@ -1299,7 +1562,7 @@ def main() -> int:
                         logger.info("Removed all of: %s", name)
                         display.show_item_removed(camera_ready, name, 0,
                                                  cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                        time.sleep(2.0)
+                        _sleep_with_button_handling(2.0)
                     else:
                         logger.info("No item to remove")
                     display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
@@ -1314,7 +1577,7 @@ def main() -> int:
                     logger.info("Barcode=%s not found (lookup %.0f ms)", barcode, lookup_ms)
                     display.show_product_not_found(camera_ready, barcode,
                                                    cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                    time.sleep(2.5)
+                    _sleep_with_button_handling(2.5)
                     display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
                     continue
 
@@ -1346,7 +1609,7 @@ def main() -> int:
                         cart.total_quantity,
                         cart.subtotal,
                     )
-                    time.sleep(2.0)
+                    _sleep_with_button_handling(2.0)
                 else:
                     display.show_product_added(
                         camera_ready,
@@ -1358,72 +1621,16 @@ def main() -> int:
                         cart.subtotal,
                         expected_weight,
                     )
-                    time.sleep(2.5)
+                    _sleep_with_button_handling(2.5)
 
                 display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
-
-            # ── CHECKOUT FLOW ────────────────────────────────────────────────
-                if checkout_triggered and cart.unique_item_count > 0:
-                    checkout_triggered = False
-                    logger.info("Starting checkout for %d items", cart.unique_item_count)
-
-                    # Show cart summary
-                    display.show_cart_summary(camera_ready, cart)
-                    time.sleep(3.0)
-
-                    # Generate UPI QR
-                    subtotal = cart.subtotal
-                    gst = subtotal * 0.18
-                    final_total = subtotal + gst
-
-                    session_id = f"SESSION_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-                    upi_string = f"upi://pay?pa={UPI_ID}&pn={SHOP_NAME}&am={final_total:.2f}&cu=INR&tn={session_id}"
-
-                    qr = qrcode.QRCode(version=1, box_size=10, border=2)
-                    qr.add_data(upi_string)
-                    qr.make(fit=True)
-                    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-
-                    display.show_payment_qr(camera_ready, final_total, qr_img)
-                    logger.info("QR code displayed for ₹%.2f", final_total)
-
-                    # Wait for payment (simulated - in real system, wait for payment confirmation)
-                    print(f"\n{'='*60}")
-                    print(f"CHECKOUT: {cart.unique_item_count} items, ₹{final_total:.2f}")
-                    print("Scan QR code to complete payment (or press Enter to simulate payment)")
-                    print("="*60)
-                    input()
-
-                    # Payment confirmed
-                    payment_ref = f"UPI_{uuid.uuid4().hex[:8]}"
-                    tx_id = save_transaction(
-                        session_id=session_id,
-                        items=cart.to_list(),
-                        total=final_total,
-                        status="paid",
-                        payment_method="UPI/QR",
-                        upi_ref=payment_ref,
-                    )
-                    logger.info("Transaction saved: id=%d session=%s", tx_id, session_id)
-
-                    display.show_payment_success(camera_ready, final_total, session_id)
-
-                    # Print receipt
-                    printer.print_receipt(session_id, cart, final_total, payment_ref)
-
-                    time.sleep(5.0)
-
-                    # Reset cart
-                    cart.clear()
-                    display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                    logger.info("Checkout complete. Ready for next customer.")
 
             except KeyboardInterrupt:
                 running = False
             except Exception as exc:
                 logger.exception("Runtime error: %s", exc)
                 try:
-                    time.sleep(1.0)
+                    _sleep_with_button_handling(1.0)
                 except Exception:
                     pass
     finally:
@@ -1434,6 +1641,10 @@ def main() -> int:
             pass
         if terminal_ctrl:
             terminal_ctrl.stop()
+        try:
+            button_ctrl.stop()
+        except Exception:
+            pass
         try:
             weights.close()
         except Exception:
