@@ -482,6 +482,16 @@ class TFTDisplay:
         draw = ImageDraw.Draw(img)
         return img, draw
 
+    def render_screen(self, image: Image.Image, screen_name: str) -> None:
+        """Render a prepared PIL image to TFT with debug prints."""
+        if image is None:
+            print(f"[TFT DEBUG] render_screen({screen_name}) image is None")
+            return
+        print(f"[TFT DEBUG] before render_screen({screen_name})")
+        print(f"[TFT DEBUG] image.size={image.size}")
+        self._render(image)
+        print(f"[TFT DEBUG] after render_screen({screen_name})")
+
     def _text_width(self, text: str, font) -> int:
         bbox = font.getbbox(text)
         return bbox[2] - bbox[0]
@@ -520,61 +530,184 @@ class TFTDisplay:
         self._blink_state = not self._blink_state
 
     # ── Screen Compositions ──────────────────────────────────────────────────
+    def compose_idle_screen(self, camera_ready: bool, unique_items: int, total_qty: int, subtotal: float) -> Image.Image:
+        img, draw = self._blank()
+
+        self._draw_camera_indicator(draw, camera_ready)
+        draw.text((22, 24), "SMART", font=_load_font(22), fill=WHITE)
+        draw.text((14, 50), "TROLLEY", font=_load_font(22), fill=YELLOW)
+        draw.line([(0, 78), (TFT_WIDTH, 78)], fill=GREY, width=1)
+        draw.text((14, 84), "Scan your items", font=_load_font(11, bold=False), fill=CYAN)
+
+        if unique_items > 0:
+            self._draw_cart_footer(draw, unique_items, total_qty, subtotal)
+        else:
+            draw.text((42, TFT_HEIGHT - 16), "• Ready •", font=_load_font(10), fill=GREEN)
+        return img
+
+    def compose_product_found_screen(
+        self,
+        camera_ready: bool,
+        product_name: str,
+        price: float,
+        qty: int,
+        weight: float | int | None,
+        unique_items: int,
+        total_qty: int,
+        subtotal: float,
+    ) -> Image.Image:
+        img, draw = self._blank("#1a1a2e")
+
+        self._draw_camera_indicator(draw, camera_ready)
+        draw.text((6, 3), "✓ ADDED", font=_load_font(14), fill=GREEN)
+        draw.line([(0, 22), (TFT_WIDTH, 22)], fill=GREY, width=1)
+
+        short = (product_name[:18] + "…") if len(product_name) > 18 else product_name
+        draw.text((6, 28), short, font=_load_font(13), fill=WHITE)
+        draw.text((6, 46), f"₹{price:.2f}", font=_load_font(16), fill=YELLOW)
+        draw.text((6, 66), f"Qty in cart: {qty}", font=_load_font(11, bold=False), fill=WHITE)
+
+        weight_txt = "-" if weight is None else str(int(weight))
+        draw.text((6, 82), f"Weight: {weight_txt}g", font=_load_font(10, bold=False), fill=WHITE)
+
+        self._draw_cart_footer(draw, unique_items, total_qty, subtotal)
+        return img
+
+    def compose_not_found_screen(
+        self,
+        camera_ready: bool,
+        barcode_string: str,
+        unique_items: int,
+        total_qty: int,
+        subtotal: float,
+    ) -> Image.Image:
+        img, draw = self._blank("#1a1a2e")
+
+        self._draw_camera_indicator(draw, camera_ready)
+        draw.text((10, 26), "✗ NOT FOUND", font=_load_font(16), fill=RED)
+        draw.text((6, 56), "Barcode:", font=_load_font(10, bold=False), fill=LT_GREY)
+        short = self._truncate(barcode_string, _load_font(10, bold=False), TFT_WIDTH - 12)
+        draw.text((6, 70), short, font=_load_font(10, bold=False), fill=WHITE)
+
+        self._draw_cart_footer(draw, unique_items, total_qty, subtotal)
+        return img
+
+    def compose_qty_updated_screen(
+        self,
+        camera_ready: bool,
+        product_name: str,
+        new_qty: int,
+        unique_items: int,
+        total_qty: int,
+        subtotal: float,
+    ) -> Image.Image:
+        img, draw = self._blank("#1a1a2e")
+
+        self._draw_camera_indicator(draw, camera_ready)
+        draw.text((6, 24), "QTY UPDATED", font=_load_font(15), fill=YELLOW)
+        short = self._truncate(product_name, _load_font(12), TFT_WIDTH - 10)
+        draw.text((6, 50), short, font=_load_font(12), fill=WHITE)
+        draw.text((6, 70), f"x{new_qty} in cart", font=_load_font(16), fill=GREEN)
+
+        self._draw_cart_footer(draw, unique_items, total_qty, subtotal)
+        return img
+
+    def compose_item_removed_screen(
+        self,
+        camera_ready: bool,
+        product_name: str,
+        new_qty: int,
+        unique_items: int,
+        total_qty: int,
+        subtotal: float,
+    ) -> Image.Image:
+        img, draw = self._blank("#1a1a2e")
+
+        self._draw_camera_indicator(draw, camera_ready)
+        draw.text((6, 24), "REMOVED", font=_load_font(16), fill=RED)
+        short = self._truncate(product_name, _load_font(12), TFT_WIDTH - 10)
+        draw.text((6, 50), short, font=_load_font(12), fill=WHITE)
+        if new_qty > 0:
+            draw.text((6, 70), f"x{new_qty} remains", font=_load_font(12, bold=False), fill=CYAN)
+
+        self._draw_cart_footer(draw, unique_items, total_qty, subtotal)
+        return img
+
     def show_idle(self, camera_ready: bool, unique_items: int, total_qty: int, subtotal: float):
         """STAGE 1: Idle / waiting for scan."""
         if not _DISPLAY_AVAILABLE or not self._device:
             logger.info("[TFT IDLE] items=%d qty=%d total=₹%.2f", unique_items, total_qty, subtotal)
             return
         try:
-            img, draw = self._blank()
-
-            # Camera indicator
-            self._draw_camera_indicator(draw, camera_ready)
-
-            # Main content
-            draw.text((22, 24), "SMART", font=_load_font(22), fill=WHITE)
-            draw.text((14, 50), "TROLLEY", font=_load_font(22), fill=YELLOW)
-            draw.line([(0, 78), (TFT_WIDTH, 78)], fill=GREY, width=1)
-            draw.text((14, 84), "Scan your items", font=_load_font(11, bold=False), fill=CYAN)
-
-            # Cart footer
-            if unique_items > 0:
-                self._draw_cart_footer(draw, unique_items, total_qty, subtotal)
-            else:
-                draw.text((42, TFT_HEIGHT - 16), "• Ready •", font=_load_font(10), fill=GREEN)
-
-            self._render(img)
+            img = self.compose_idle_screen(camera_ready, unique_items, total_qty, subtotal)
+            print("[TFT DEBUG] about to render idle")
+            print(f"[TFT DEBUG] idle image size={img.size}")
+            self.render_screen(img, "idle")
+            print("[TFT DEBUG] idle rendered")
         except Exception as exc:
             logger.error("TFT show_idle: %s", exc)
 
-    def show_product_added(self, camera_ready: bool, name: str, price: float, qty: int,
-                          unique_items: int, total_qty: int, subtotal: float):
+    def show_product_added(
+        self,
+        camera_ready: bool,
+        name: str,
+        price: float,
+        qty: int,
+        unique_items: int,
+        total_qty: int,
+        subtotal: float,
+        weight: float | int | None = None,
+    ):
         """STAGE 2: Product found and added."""
         if not _DISPLAY_AVAILABLE or not self._device:
             logger.info("[TFT+] %s ₹%.2f×%d", name, price, qty)
             return
         try:
-            img, draw = self._blank()
-
-            # Camera indicator
-            self._draw_camera_indicator(draw, camera_ready)
-
-            # Header
-            draw.rectangle([(0, 0), (TFT_WIDTH, 20)], fill=DK_GREEN)
-            draw.text((6, 3), "✓ ADDED", font=_load_font(14), fill=GREEN)
-
-            # Content
-            short = self._truncate(name, _load_font(13), TFT_WIDTH - 10)
-            draw.text((6, 26), short, font=_load_font(13), fill=WHITE)
-            draw.text((6, 44), f"₹{price:.2f}", font=_load_font(14), fill=YELLOW)
-            draw.text((6, 62), f"Qty in cart: {qty}", font=_load_font(11, bold=False), fill=CYAN)
-
-            # Cart footer
-            self._draw_cart_footer(draw, unique_items, total_qty, subtotal)
-
-            self._render(img)
+            img = self.compose_product_found_screen(
+                camera_ready,
+                name,
+                price,
+                qty,
+                weight,
+                unique_items,
+                total_qty,
+                subtotal,
+            )
+            print("[TFT DEBUG] about to render product_found")
+            print(f"[TFT DEBUG] product_found image size={img.size}")
+            self.render_screen(img, "product_found")
+            print("[TFT DEBUG] product_found rendered")
         except Exception as exc:
             logger.error("TFT show_product_added: %s", exc)
+
+    def show_qty_updated(
+        self,
+        camera_ready: bool,
+        name: str,
+        new_qty: int,
+        unique_items: int,
+        total_qty: int,
+        subtotal: float,
+    ) -> None:
+        """STAGE 2b: Duplicate barcode scanned, quantity increased."""
+        if not _DISPLAY_AVAILABLE or not self._device:
+            logger.info("[TFT QTY] %s x%d", name, new_qty)
+            return
+        try:
+            img = self.compose_qty_updated_screen(
+                camera_ready,
+                name,
+                new_qty,
+                unique_items,
+                total_qty,
+                subtotal,
+            )
+            print("[TFT DEBUG] about to render qty_updated")
+            print(f"[TFT DEBUG] qty_updated image size={img.size}")
+            self.render_screen(img, "qty_updated")
+            print("[TFT DEBUG] qty_updated rendered")
+        except Exception as exc:
+            logger.error("TFT show_qty_updated: %s", exc)
 
     def show_product_not_found(self, camera_ready: bool, barcode: str,
                                unique_items: int, total_qty: int, subtotal: float):
@@ -583,26 +716,17 @@ class TFTDisplay:
             logger.info("[TFT MISS] barcode=%s", barcode)
             return
         try:
-            img, draw = self._blank()
-
-            # Camera indicator
-            self._draw_camera_indicator(draw, camera_ready)
-
-            # Header
-            draw.rectangle([(0, 0), (TFT_WIDTH, 20)], fill=DK_RED)
-            draw.text((6, 3), "NOT FOUND", font=_load_font(14), fill=RED)
-
-            # Content
-            draw.text((6, 28), "Product not found", font=_load_font(12), fill=WHITE)
-            short_code = self._truncate(barcode, _load_font(10, bold=False), TFT_WIDTH - 10)
-            draw.text((6, 48), short_code, font=_load_font(10, bold=False), fill=LT_GREY)
-            draw.text((6, 68), "Try scanning again", font=_load_font(10, bold=False), fill=ORANGE)
-
-            # Cart footer
-            if unique_items > 0:
-                self._draw_cart_footer(draw, unique_items, total_qty, subtotal)
-
-            self._render(img)
+            img = self.compose_not_found_screen(
+                camera_ready,
+                barcode,
+                unique_items,
+                total_qty,
+                subtotal,
+            )
+            print("[TFT DEBUG] about to render not_found")
+            print(f"[TFT DEBUG] not_found image size={img.size}")
+            self.render_screen(img, "not_found")
+            print("[TFT DEBUG] not_found rendered")
         except Exception as exc:
             logger.error("TFT show_product_not_found: %s", exc)
 
@@ -613,28 +737,18 @@ class TFTDisplay:
             logger.info("[TFT-] %s new_qty=%d", name, new_qty)
             return
         try:
-            img, draw = self._blank()
-
-            # Camera indicator
-            self._draw_camera_indicator(draw, camera_ready)
-
-            # Header
-            draw.rectangle([(0, 0), (TFT_WIDTH, 20)], fill=DK_RED)
-            draw.text((6, 3), "REMOVED" if new_qty == 0 else "QTY -1", font=_load_font(14), fill=RED)
-
-            # Content
-            short = self._truncate(name, _load_font(13), TFT_WIDTH - 10)
-            draw.text((6, 28), short, font=_load_font(13), fill=WHITE)
-            if new_qty > 0:
-                draw.text((6, 48), f"New qty: {new_qty}", font=_load_font(12), fill=CYAN)
-            else:
-                draw.text((6, 48), "Removed from cart", font=_load_font(11), fill=ORANGE)
-
-            # Cart footer
-            if unique_items > 0:
-                self._draw_cart_footer(draw, unique_items, total_qty, subtotal)
-
-            self._render(img)
+            img = self.compose_item_removed_screen(
+                camera_ready,
+                name,
+                new_qty,
+                unique_items,
+                total_qty,
+                subtotal,
+            )
+            print("[TFT DEBUG] about to render item_removed")
+            print(f"[TFT DEBUG] item_removed image size={img.size}")
+            self.render_screen(img, "item_removed")
+            print("[TFT DEBUG] item_removed rendered")
         except Exception as exc:
             logger.error("TFT show_item_removed: %s", exc)
 
@@ -1128,11 +1242,12 @@ def main() -> int:
                     logger.info("Barcode=%s not found (lookup %.0f ms)", barcode, lookup_ms)
                     display.show_product_not_found(camera_ready, barcode,
                                                    cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                    time.sleep(2.0)
+                    time.sleep(2.5)
                     display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
                     continue
 
             # Add to cart
+                was_already_in_cart = barcode in cart.items
                 name, qty = cart.add(product)
                 measured_weight = weights.read_grams()
                 expected_weight = product.get("weight_grams")
@@ -1150,17 +1265,29 @@ def main() -> int:
                     cart.subtotal,
                 )
 
-                display.show_product_added(
-                    camera_ready,
-                    name,
-                    float(product["price"]),
-                    qty,
-                    cart.unique_item_count,
-                    cart.total_quantity,
-                    cart.subtotal,
-                )
+                if was_already_in_cart:
+                    display.show_qty_updated(
+                        camera_ready,
+                        name,
+                        qty,
+                        cart.unique_item_count,
+                        cart.total_quantity,
+                        cart.subtotal,
+                    )
+                    time.sleep(2.0)
+                else:
+                    display.show_product_added(
+                        camera_ready,
+                        name,
+                        float(product["price"]),
+                        qty,
+                        cart.unique_item_count,
+                        cart.total_quantity,
+                        cart.subtotal,
+                        expected_weight,
+                    )
+                    time.sleep(2.5)
 
-                time.sleep(2.0)
                 display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
 
             # ── CHECKOUT FLOW ────────────────────────────────────────────────

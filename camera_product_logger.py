@@ -89,6 +89,9 @@ TFT_CLEANUP_ON_EXIT = os.getenv("TFT_CLEANUP_ON_EXIT", "0").strip().lower() in {
 }
 # 0 disables periodic reinit; on-demand reinit still happens on render failure.
 TFT_REINIT_SECONDS = float(os.getenv("TFT_REINIT_SECONDS", "0"))
+PRODUCT_FOUND_HOLD_SECONDS = float(os.getenv("PRODUCT_FOUND_HOLD_SECONDS", "2.5"))
+NOT_FOUND_HOLD_SECONDS = float(os.getenv("NOT_FOUND_HOLD_SECONDS", "2.5"))
+ERROR_HOLD_SECONDS = float(os.getenv("ERROR_HOLD_SECONDS", "1.5"))
 
 
 def _call_with_timeout(fn, timeout_seconds: float, name: str) -> bool:
@@ -533,6 +536,8 @@ def main() -> int:
     last_seen_at = 0.0
     waiting_refresh_at = 0.0
     tft_reinit_at = time.monotonic()
+    display_mode = "waiting"
+    feedback_hold_until = 0.0
     stop_requested_at = 0.0
     stop_signal_count = 0
 
@@ -554,21 +559,33 @@ def main() -> int:
         logger.info("Ready. Point camera at barcode...")
         if display:
             display.show_waiting()
+            waiting_refresh_at = time.monotonic()
 
         while running:
+            now = time.monotonic()
+
             if stop_requested_at and (time.monotonic() - stop_requested_at) > 2.0:
                 logger.warning("Forced shutdown after stop timeout")
                 os._exit(130)
 
-            if display and time.monotonic() - waiting_refresh_at > 1.0:
-                display.show_waiting()
-                waiting_refresh_at = time.monotonic()
+            if display and display_mode == "feedback":
+                if now >= feedback_hold_until:
+                    display.show_waiting()
+                    display_mode = "waiting"
+                    waiting_refresh_at = now
+                else:
+                    time.sleep(0.03)
+                    continue
 
-            if display and TFT_REINIT_SECONDS > 0 and (time.monotonic() - tft_reinit_at) > TFT_REINIT_SECONDS:
+            if display and display_mode == "waiting" and (now - waiting_refresh_at) > 1.0:
+                display.show_waiting()
+                waiting_refresh_at = now
+
+            if display and TFT_REINIT_SECONDS > 0 and (now - tft_reinit_at) > TFT_REINIT_SECONDS:
                 if display.force_reinit():
                     logger.info("Periodic TFT re-init completed")
                     display.show_waiting()
-                tft_reinit_at = time.monotonic()
+                tft_reinit_at = now
 
             try:
                 barcode = scanner.read_barcode()
@@ -576,6 +593,8 @@ def main() -> int:
                 logger.error("Camera read error: %s", exc)
                 if display:
                     display.show_error("Camera read failed")
+                    display_mode = "feedback"
+                    feedback_hold_until = time.monotonic() + ERROR_HOLD_SECONDS
                 time.sleep(0.2)
                 continue
 
@@ -600,8 +619,8 @@ def main() -> int:
                 logger.warning("Product not found for barcode=%s", barcode)
                 if display:
                     display.show_not_found(barcode)
-                    time.sleep(1.1)
-                    display.show_waiting()
+                    display_mode = "feedback"
+                    feedback_hold_until = time.monotonic() + NOT_FOUND_HOLD_SECONDS
                     tft_reinit_at = time.monotonic()
                 continue
 
@@ -615,6 +634,8 @@ def main() -> int:
             )
             if display:
                 display.show_product(product)
+                display_mode = "feedback"
+                feedback_hold_until = time.monotonic() + PRODUCT_FOUND_HOLD_SECONDS
                 tft_reinit_at = time.monotonic()
 
     finally:
