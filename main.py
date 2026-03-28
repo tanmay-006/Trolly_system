@@ -103,6 +103,15 @@ SCAN_DEBOUNCE_SECONDS = float(os.getenv("SCAN_DEBOUNCE_SECONDS", "1.2"))
 SMART_TROLLEY_AUTO_TAKEOVER = os.getenv("SMART_TROLLEY_AUTO_TAKEOVER", "1").strip().lower() in {
     "1", "true", "yes"
 }
+TFT_SPI_PORT = int(os.getenv("TFT_SPI_PORT", "0"))
+TFT_SPI_DEVICE = int(os.getenv("TFT_SPI_DEVICE", "0"))
+TFT_DC_PIN = int(os.getenv("TFT_DC_PIN", "24"))
+TFT_RST_PIN = int(os.getenv("TFT_RST_PIN", "25"))
+TFT_BUS_SPEED_HZ = int(os.getenv("TFT_BUS_SPEED_HZ", "4000000"))
+TFT_REINIT_SECONDS = float(os.getenv("TFT_REINIT_SECONDS", "25"))
+TFT_CLEANUP_ON_EXIT = os.getenv("TFT_CLEANUP_ON_EXIT", "0").strip().lower() in {
+    "1", "true", "yes"
+}
 
 # Special barcode commands
 BARCODE_REMOVE_LAST = "REMOVE_LAST"
@@ -436,28 +445,76 @@ class TFTDisplay:
         if not _DISPLAY_AVAILABLE:
             logger.warning("TFT display unavailable (luma.lcd/PIL not found)")
             return
+
+        self._init_device()
+
+    def _hardware_reset(self) -> None:
+        """Pulse RST pin to recover panel state after abrupt stop/restart."""
+        if GPIO is None:
+            return
         try:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(TFT_RST_PIN, GPIO.OUT, initial=GPIO.HIGH)
+            time.sleep(0.04)
+            GPIO.output(TFT_RST_PIN, GPIO.LOW)
+            time.sleep(0.12)
+            GPIO.output(TFT_RST_PIN, GPIO.HIGH)
+            time.sleep(0.18)
+        except Exception as exc:
+            logger.warning("TFT hardware reset failed: %s", exc)
+
+    def _init_device(self) -> bool:
+        try:
+            self._hardware_reset()
             serial = spi(
-                port=0, device=0,
-                gpio_DC=24, gpio_RST=25,
-                bus_speed_hz=16_000_000,
+                port=TFT_SPI_PORT,
+                device=TFT_SPI_DEVICE,
+                gpio_DC=TFT_DC_PIN,
+                gpio_RST=TFT_RST_PIN,
+                bus_speed_hz=TFT_BUS_SPEED_HZ,
             )
             self._device = st7735(
                 serial,
-                width=TFT_WIDTH, height=TFT_HEIGHT,
-                rotate=2, bgr=True,
+                width=TFT_WIDTH,
+                height=TFT_HEIGHT,
+                rotate=2,
+                bgr=True,
             )
-            logger.info("TFT display initialized (%dx%d)", TFT_WIDTH, TFT_HEIGHT)
+            logger.info(
+                "TFT display initialized (port=%d device=%d dc=%d rst=%d speed=%d)",
+                TFT_SPI_PORT,
+                TFT_SPI_DEVICE,
+                TFT_DC_PIN,
+                TFT_RST_PIN,
+                TFT_BUS_SPEED_HZ,
+            )
+            return True
         except Exception as exc:
-            logger.error("TFT init failed: %s", exc)
+            logger.warning("TFT init failed: %s", exc)
             self._device = None
+            return False
 
     def _render(self, image: Image.Image) -> None:
         """Push PIL image to display (thread-safe)."""
-        if not self._device:
+        if not self._device and not self._init_device():
             return
         with self._lock:
-            self._device.display(image)
+            try:
+                self._device.display(image)
+            except Exception as exc:
+                logger.warning("TFT render failed (%s), retrying after re-init", exc)
+                self._device = None
+                if not self._init_device():
+                    return
+                try:
+                    self._device.display(image)
+                except Exception as exc2:
+                    logger.warning("TFT second render attempt failed: %s", exc2)
+
+    def force_reinit(self) -> bool:
+        """Recreate TFT device to recover from stale display state."""
+        self._device = None
+        return self._init_device()
 
     def show_boot_splash(self) -> None:
         """High-contrast startup splash to confirm panel is alive."""
@@ -855,16 +912,22 @@ class TFTDisplay:
         """Release display resources cleanly for repeat launches."""
         if not self._device:
             return
-        try:
-            if hasattr(self._device, "clear"):
-                self._device.clear()
-        except Exception:
-            pass
-        try:
-            if hasattr(self._device, "cleanup"):
-                self._device.cleanup()
-        except Exception:
-            pass
+        if TFT_CLEANUP_ON_EXIT:
+            try:
+                if hasattr(self._device, "clear"):
+                    self._device.clear()
+            except Exception:
+                pass
+            try:
+                if hasattr(self._device, "cleanup"):
+                    self._device.cleanup()
+            except Exception:
+                pass
+            if GPIO is not None:
+                try:
+                    GPIO.cleanup([TFT_DC_PIN, TFT_RST_PIN])
+                except Exception:
+                    pass
         self._device = None
 
 
@@ -1145,6 +1208,7 @@ def main() -> int:
     last_seen_at = 0.0
     checkout_triggered = False
     blink_timer = time.time()
+    tft_reinit_at = time.monotonic()
 
     def _handle_stop(_sig=None, _frame=None):
         nonlocal running
@@ -1168,6 +1232,14 @@ def main() -> int:
                     camera_ready = scanner.is_camera_ready()
                     display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
                     blink_timer = time.time()
+
+                now_mono = time.monotonic()
+                if TFT_REINIT_SECONDS > 0 and (now_mono - tft_reinit_at) > TFT_REINIT_SECONDS:
+                    logger.info("Periodic TFT re-init to recover stale panel state")
+                    if display.force_reinit():
+                        camera_ready = scanner.is_camera_ready()
+                        display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                    tft_reinit_at = now_mono
 
             # Terminal controller not used when camera is working
             # Commands are handled through barcode scans ('done', 'clear', 'quit')
