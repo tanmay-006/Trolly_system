@@ -20,6 +20,7 @@ import threading
 import queue
 import json
 import uuid
+import fcntl
 from dataclasses import dataclass
 from datetime import datetime
 from contextlib import contextmanager
@@ -63,6 +64,12 @@ except Exception:
     _HX711_AVAILABLE = False
 
 try:
+    import RPi.GPIO as GPIO
+    GPIO.setwarnings(False)
+except Exception:
+    GPIO = None
+
+try:
     from luma.core.interface.serial import spi
     from luma.lcd.device import st7735
     from PIL import Image, ImageDraw, ImageFont
@@ -93,6 +100,9 @@ HX711_DOUT_PIN = int(os.getenv("HX711_DOUT_PIN", "5"))
 HX711_SCK_PIN = int(os.getenv("HX711_SCK_PIN", "6"))
 HX711_DISABLE = os.getenv("HX711_DISABLE", "0").strip().lower() in {"1", "true", "yes"}
 SCAN_DEBOUNCE_SECONDS = float(os.getenv("SCAN_DEBOUNCE_SECONDS", "1.2"))
+SMART_TROLLEY_AUTO_TAKEOVER = os.getenv("SMART_TROLLEY_AUTO_TAKEOVER", "1").strip().lower() in {
+    "1", "true", "yes"
+}
 
 # Special barcode commands
 BARCODE_REMOVE_LAST = "REMOVE_LAST"
@@ -257,6 +267,8 @@ class WeightReader:
 
     def __init__(self, dout_pin: int, sck_pin: int):
         self._hx = None
+        self._dout_pin = dout_pin
+        self._sck_pin = sck_pin
         if HX711_DISABLE:
             logger.warning("HX711 disabled by HX711_DISABLE flag")
             return
@@ -319,6 +331,20 @@ class WeightReader:
         except Exception as exc:
             logger.warning("HX711 read failed: %s", exc)
             return None
+
+    def close(self) -> None:
+        """Release HX711/GPIO resources so reruns do not require reboot."""
+        try:
+            if self._hx and hasattr(self._hx, "power_down"):
+                self._hx.power_down()
+        except Exception:
+            pass
+        try:
+            if hasattr(HX711, "GPIO") and hasattr(HX711.GPIO, "cleanup"):
+                HX711.GPIO.cleanup([self._dout_pin, self._sck_pin])
+        except Exception:
+            pass
+        self._hx = None
 
 
 # ── Barcode Scanner ──────────────────────────────────────────────────────────
@@ -383,6 +409,11 @@ class BarcodeScanner:
                 self._camera.stop()
             except Exception:
                 pass
+            try:
+                self._camera.close()
+            except Exception:
+                pass
+            self._camera = None
 
 
 # ── TFT Display Driver ───────────────────────────────────────────────────────
@@ -427,6 +458,24 @@ class TFTDisplay:
             return
         with self._lock:
             self._device.display(image)
+
+    def show_boot_splash(self) -> None:
+        """High-contrast startup splash to confirm panel is alive."""
+        if not self._device:
+            return
+        try:
+            white = Image.new("RGB", (TFT_WIDTH, TFT_HEIGHT), "white")
+            self._render(white)
+            time.sleep(0.15)
+
+            img = Image.new("RGB", (TFT_WIDTH, TFT_HEIGHT), "black")
+            draw = ImageDraw.Draw(img)
+            draw.text((16, 34), "TFT READY", font=_load_font(20), fill=YELLOW)
+            draw.text((28, 66), "SMART TROLLEY", font=_load_font(12, bold=False), fill=CYAN)
+            self._render(img)
+            time.sleep(0.35)
+        except Exception as exc:
+            logger.warning("TFT boot splash failed: %s", exc)
 
     def _blank(self, bg: str = BG) -> tuple:
         img = Image.new("RGB", (TFT_WIDTH, TFT_HEIGHT), bg)
@@ -688,6 +737,22 @@ class TFTDisplay:
         except Exception as exc:
             logger.error("TFT show_payment_success: %s", exc)
 
+    def close(self) -> None:
+        """Release display resources cleanly for repeat launches."""
+        if not self._device:
+            return
+        try:
+            if hasattr(self._device, "clear"):
+                self._device.clear()
+        except Exception:
+            pass
+        try:
+            if hasattr(self._device, "cleanup"):
+                self._device.cleanup()
+        except Exception:
+            pass
+        self._device = None
+
 
 # ── Receipt Printer ──────────────────────────────────────────────────────────
 class ReceiptPrinter:
@@ -734,6 +799,117 @@ class ReceiptPrinter:
             logger.info("Receipt printed for %s", session_id)
         except Exception as exc:
             logger.error("Receipt print failed: %s", exc)
+
+    def close(self) -> None:
+        if not self._printer:
+            return
+        try:
+            if hasattr(self._printer, "close"):
+                self._printer.close()
+        except Exception:
+            pass
+        self._printer = None
+
+
+class SingleInstanceLock:
+    """Prevent multiple runtime instances from colliding on camera/SPI/GPIO."""
+
+    def __init__(self, lock_path: str = "/tmp/smart_trolley_main.lock"):
+        self._lock_path = lock_path
+        self._fd = None
+        self._holder_pid: int | None = None
+
+    def acquire(self) -> bool:
+        self._fd = open(self._lock_path, "a+")
+        self._fd.seek(0)
+        raw = self._fd.read().strip()
+        try:
+            self._holder_pid = int(raw) if raw else None
+        except ValueError:
+            self._holder_pid = None
+
+        try:
+            fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            try:
+                self._fd.close()
+            except Exception:
+                pass
+            self._fd = None
+            return False
+
+        self._fd.seek(0)
+        self._fd.truncate()
+        self._fd.write(str(os.getpid()))
+        self._fd.flush()
+        self._holder_pid = os.getpid()
+        return True
+
+    def holder_pid(self) -> int | None:
+        return self._holder_pid
+
+    def release(self) -> None:
+        if not self._fd:
+            return
+        try:
+            fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            self._fd.close()
+        except Exception:
+            pass
+        self._fd = None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _is_main_runtime_process(pid: int) -> bool:
+    """Best-effort check to avoid killing unrelated processes."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().decode("utf-8", errors="ignore").replace("\x00", " ")
+        return "python" in cmdline and "main.py" in cmdline and "Trolly_system" in cmdline
+    except Exception:
+        return False
+
+
+def _terminate_process(pid: int, grace_seconds: float = 2.0) -> bool:
+    if not _pid_alive(pid):
+        return True
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.1)
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.1)
+    return not _pid_alive(pid)
 
 
 # ── Terminal Control Thread ─────────────────────────────────────────────────
@@ -789,15 +965,45 @@ def main() -> int:
         logger.error("DATABASE_URL missing. Set it in .env before running.")
         return 1
 
+    lock = SingleInstanceLock()
+    if not lock.acquire():
+        holder = lock.holder_pid()
+        if holder and SMART_TROLLEY_AUTO_TAKEOVER and holder != os.getpid() and _is_main_runtime_process(holder):
+            logger.warning("Detected existing runtime pid=%d, attempting safe takeover", holder)
+            if _terminate_process(holder):
+                logger.info("Previous runtime pid=%d stopped, retrying lock", holder)
+                if not lock.acquire():
+                    logger.error("Could not acquire lock after takeover attempt")
+                    return 1
+            else:
+                logger.error("Could not stop existing runtime pid=%d", holder)
+                return 1
+        else:
+            if holder:
+                logger.error(
+                    "Another main.py instance is already running (pid=%d). "
+                    "Stop it first: pgrep -af \"python.*main.py\" && kill %d",
+                    holder,
+                    holder,
+                )
+            else:
+                logger.error(
+                    "Another main.py instance is already running. "
+                    "Stop it first: pgrep -af \"python.*main.py\""
+                )
+            return 1
+
     # Initialize hardware
     try:
         display = TFTDisplay()
+        display.show_boot_splash()
         cart = SessionCart()
         scanner = BarcodeScanner()
         weights = WeightReader(HX711_DOUT_PIN, HX711_SCK_PIN)
         printer = ReceiptPrinter(BLUETOOTH_PRINTER_MAC)
     except KeyboardInterrupt:
         logger.info("Startup interrupted by user")
+        lock.release()
         return 130
 
     # Terminal control thread (only when camera uses stdin fallback)
@@ -839,194 +1045,215 @@ def main() -> int:
     logger.info("Pi runtime ready. Waiting for barcode scans...")
 
     # Main event loop
-    while running:
-        try:
+    try:
+        while running:
+            try:
             # Camera indicator blink (every 1 second)
-            if time.time() - blink_timer > 1.0:
-                display.toggle_blink()
-                camera_ready = scanner.is_camera_ready()
-                display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                blink_timer = time.time()
+                if time.time() - blink_timer > 1.0:
+                    display.toggle_blink()
+                    camera_ready = scanner.is_camera_ready()
+                    display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                    blink_timer = time.time()
 
             # Terminal controller not used when camera is working
             # Commands are handled through barcode scans ('done', 'clear', 'quit')
 
             # Barcode scan
-            barcode = scanner.read_barcode()
-            if not barcode:
-                if scanner._mock_stdin:
-                    time.sleep(0.2)
-                continue
+                barcode = scanner.read_barcode()
+                if not barcode:
+                    if scanner._mock_stdin:
+                        time.sleep(0.2)
+                    continue
 
             # Debounce
-            now = time.monotonic()
-            if barcode == last_barcode and (now - last_seen_at) < SCAN_DEBOUNCE_SECONDS:
-                continue
-            last_barcode = barcode
-            last_seen_at = now
+                now = time.monotonic()
+                if barcode == last_barcode and (now - last_seen_at) < SCAN_DEBOUNCE_SECONDS:
+                    continue
+                last_barcode = barcode
+                last_seen_at = now
 
-            camera_ready = scanner.is_camera_ready()
+                camera_ready = scanner.is_camera_ready()
 
             # Handle special commands (when using stdin fallback)
-            if barcode.lower() in ("quit", "done", "clear"):
-                if barcode.lower() == "quit":
-                    logger.info("Quit command received")
-                    running = False
-                    break
-                elif barcode.lower() == "clear":
-                    logger.info("Clear cart command")
-                    cart.clear()
-                    display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                    print("Cart cleared.")
-                elif barcode.lower() == "done":
-                    if cart.unique_item_count == 0:
-                        print("Cart is empty. Add items before checkout.")
-                    else:
-                        logger.info("Checkout triggered")
-                        checkout_triggered = True
-                continue
+                if barcode.lower() in ("quit", "done", "clear"):
+                    if barcode.lower() == "quit":
+                        logger.info("Quit command received")
+                        running = False
+                        break
+                    elif barcode.lower() == "clear":
+                        logger.info("Clear cart command")
+                        cart.clear()
+                        display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                        print("Cart cleared.")
+                    elif barcode.lower() == "done":
+                        if cart.unique_item_count == 0:
+                            print("Cart is empty. Add items before checkout.")
+                        else:
+                            logger.info("Checkout triggered")
+                            checkout_triggered = True
+                    continue
 
             # Handle special barcodes
-            if barcode == BARCODE_REMOVE_LAST:
-                result = cart.decrement_last()
-                if result:
-                    name, new_qty = result
-                    logger.info("Decremented %s → qty=%d", name, new_qty)
-                    display.show_item_removed(camera_ready, name, new_qty,
-                                             cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                    time.sleep(2.0)
-                else:
-                    logger.info("No item to decrement")
-                display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                continue
+                if barcode == BARCODE_REMOVE_LAST:
+                    result = cart.decrement_last()
+                    if result:
+                        name, new_qty = result
+                        logger.info("Decremented %s → qty=%d", name, new_qty)
+                        display.show_item_removed(camera_ready, name, new_qty,
+                                                 cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                        time.sleep(2.0)
+                    else:
+                        logger.info("No item to decrement")
+                    display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                    continue
 
-            if barcode == BARCODE_CMD_CLEAR:
-                name = cart.remove_last()
-                if name:
-                    logger.info("Removed all of: %s", name)
-                    display.show_item_removed(camera_ready, name, 0,
-                                             cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                    time.sleep(2.0)
-                else:
-                    logger.info("No item to remove")
-                display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                continue
+                if barcode == BARCODE_CMD_CLEAR:
+                    name = cart.remove_last()
+                    if name:
+                        logger.info("Removed all of: %s", name)
+                        display.show_item_removed(camera_ready, name, 0,
+                                                 cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                        time.sleep(2.0)
+                    else:
+                        logger.info("No item to remove")
+                    display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                    continue
 
             # Regular product lookup
-            t0 = time.monotonic()
-            product = get_product_by_barcode(barcode)
-            lookup_ms = (time.monotonic() - t0) * 1000.0
+                t0 = time.monotonic()
+                product = get_product_by_barcode(barcode)
+                lookup_ms = (time.monotonic() - t0) * 1000.0
 
-            if not product:
-                logger.info("Barcode=%s not found (lookup %.0f ms)", barcode, lookup_ms)
-                display.show_product_not_found(camera_ready, barcode,
-                                               cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                time.sleep(2.0)
-                display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                continue
+                if not product:
+                    logger.info("Barcode=%s not found (lookup %.0f ms)", barcode, lookup_ms)
+                    display.show_product_not_found(camera_ready, barcode,
+                                                   cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                    time.sleep(2.0)
+                    display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                    continue
 
             # Add to cart
-            name, qty = cart.add(product)
-            measured_weight = weights.read_grams()
-            expected_weight = product.get("weight_grams")
+                name, qty = cart.add(product)
+                measured_weight = weights.read_grams()
+                expected_weight = product.get("weight_grams")
 
-            logger.info(
-                "Scan OK barcode=%s name=%s qty=%d lookup=%.0fms exp_g=%s meas_g=%s items=%d total_qty=%d subtotal=₹%.2f",
-                barcode,
-                name,
-                qty,
-                lookup_ms,
-                expected_weight,
-                measured_weight,
-                cart.unique_item_count,
-                cart.total_quantity,
-                cart.subtotal,
-            )
+                logger.info(
+                    "Scan OK barcode=%s name=%s qty=%d lookup=%.0fms exp_g=%s meas_g=%s items=%d total_qty=%d subtotal=₹%.2f",
+                    barcode,
+                    name,
+                    qty,
+                    lookup_ms,
+                    expected_weight,
+                    measured_weight,
+                    cart.unique_item_count,
+                    cart.total_quantity,
+                    cart.subtotal,
+                )
 
-            display.show_product_added(
-                camera_ready,
-                name,
-                float(product["price"]),
-                qty,
-                cart.unique_item_count,
-                cart.total_quantity,
-                cart.subtotal,
-            )
+                display.show_product_added(
+                    camera_ready,
+                    name,
+                    float(product["price"]),
+                    qty,
+                    cart.unique_item_count,
+                    cart.total_quantity,
+                    cart.subtotal,
+                )
 
-            time.sleep(2.0)
-            display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                time.sleep(2.0)
+                display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
 
             # ── CHECKOUT FLOW ────────────────────────────────────────────────
-            if checkout_triggered and cart.unique_item_count > 0:
-                checkout_triggered = False
-                logger.info("Starting checkout for %d items", cart.unique_item_count)
+                if checkout_triggered and cart.unique_item_count > 0:
+                    checkout_triggered = False
+                    logger.info("Starting checkout for %d items", cart.unique_item_count)
 
-                # Show cart summary
-                display.show_cart_summary(camera_ready, cart)
-                time.sleep(3.0)
+                    # Show cart summary
+                    display.show_cart_summary(camera_ready, cart)
+                    time.sleep(3.0)
 
-                # Generate UPI QR
-                subtotal = cart.subtotal
-                gst = subtotal * 0.18
-                final_total = subtotal + gst
+                    # Generate UPI QR
+                    subtotal = cart.subtotal
+                    gst = subtotal * 0.18
+                    final_total = subtotal + gst
 
-                session_id = f"SESSION_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-                upi_string = f"upi://pay?pa={UPI_ID}&pn={SHOP_NAME}&am={final_total:.2f}&cu=INR&tn={session_id}"
+                    session_id = f"SESSION_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+                    upi_string = f"upi://pay?pa={UPI_ID}&pn={SHOP_NAME}&am={final_total:.2f}&cu=INR&tn={session_id}"
 
-                qr = qrcode.QRCode(version=1, box_size=10, border=2)
-                qr.add_data(upi_string)
-                qr.make(fit=True)
-                qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+                    qr = qrcode.QRCode(version=1, box_size=10, border=2)
+                    qr.add_data(upi_string)
+                    qr.make(fit=True)
+                    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
-                display.show_payment_qr(camera_ready, final_total, qr_img)
-                logger.info("QR code displayed for ₹%.2f", final_total)
+                    display.show_payment_qr(camera_ready, final_total, qr_img)
+                    logger.info("QR code displayed for ₹%.2f", final_total)
 
-                # Wait for payment (simulated - in real system, wait for payment confirmation)
-                print(f"\n{'='*60}")
-                print(f"CHECKOUT: {cart.unique_item_count} items, ₹{final_total:.2f}")
-                print("Scan QR code to complete payment (or press Enter to simulate payment)")
-                print("="*60)
-                input()
+                    # Wait for payment (simulated - in real system, wait for payment confirmation)
+                    print(f"\n{'='*60}")
+                    print(f"CHECKOUT: {cart.unique_item_count} items, ₹{final_total:.2f}")
+                    print("Scan QR code to complete payment (or press Enter to simulate payment)")
+                    print("="*60)
+                    input()
 
-                # Payment confirmed
-                payment_ref = f"UPI_{uuid.uuid4().hex[:8]}"
-                tx_id = save_transaction(
-                    session_id=session_id,
-                    items=cart.to_list(),
-                    total=final_total,
-                    status="paid",
-                    payment_method="UPI/QR",
-                    upi_ref=payment_ref,
-                )
-                logger.info("Transaction saved: id=%d session=%s", tx_id, session_id)
+                    # Payment confirmed
+                    payment_ref = f"UPI_{uuid.uuid4().hex[:8]}"
+                    tx_id = save_transaction(
+                        session_id=session_id,
+                        items=cart.to_list(),
+                        total=final_total,
+                        status="paid",
+                        payment_method="UPI/QR",
+                        upi_ref=payment_ref,
+                    )
+                    logger.info("Transaction saved: id=%d session=%s", tx_id, session_id)
 
-                display.show_payment_success(camera_ready, final_total, session_id)
+                    display.show_payment_success(camera_ready, final_total, session_id)
 
-                # Print receipt
-                printer.print_receipt(session_id, cart, final_total, payment_ref)
+                    # Print receipt
+                    printer.print_receipt(session_id, cart, final_total, payment_ref)
 
-                time.sleep(5.0)
+                    time.sleep(5.0)
 
-                # Reset cart
-                cart.clear()
-                display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                logger.info("Checkout complete. Ready for next customer.")
+                    # Reset cart
+                    cart.clear()
+                    display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                    logger.info("Checkout complete. Ready for next customer.")
 
-        except KeyboardInterrupt:
-            running = False
-        except Exception as exc:
-            logger.exception("Runtime error: %s", exc)
-            try:
-                time.sleep(1.0)
-            except Exception:
-                pass
+            except KeyboardInterrupt:
+                running = False
+            except Exception as exc:
+                logger.exception("Runtime error: %s", exc)
+                try:
+                    time.sleep(1.0)
+                except Exception:
+                    pass
+    finally:
+        # Cleanup
+        try:
+            scanner.close()
+        except Exception:
+            pass
+        if terminal_ctrl:
+            terminal_ctrl.stop()
+        try:
+            weights.close()
+        except Exception:
+            pass
+        try:
+            camera_ready = scanner.is_camera_ready()
+            display.show_idle(camera_ready, 0, 0, 0.0)
+        except Exception:
+            pass
+        try:
+            display.close()
+        except Exception:
+            pass
+        try:
+            printer.close()
+        except Exception:
+            pass
+        lock.release()
 
-    # Cleanup
-    scanner.close()
-    if terminal_ctrl:
-        terminal_ctrl.stop()
-    camera_ready = scanner.is_camera_ready()
-    display.show_idle(camera_ready, 0, 0, 0.0)
     logger.info("Pi runtime stopped")
     return 0
 
