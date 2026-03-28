@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import socket
 import signal
 import logging
 import threading
@@ -95,6 +96,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 UPI_ID = os.getenv("UPI_ID", "yourshop@upi")
 SHOP_NAME = os.getenv("SHOP_NAME", "Smart Trolley Shop")
 BLUETOOTH_PRINTER_MAC = os.getenv("BLUETOOTH_PRINTER_MAC", "").strip()
+BT_PRINTER_CHANNEL = int(os.getenv("BT_PRINTER_CHANNEL", "1"))
+BT_PRINTER_ROW_DELAY_SECONDS = float(os.getenv("BT_PRINTER_ROW_DELAY_SECONDS", "0.005"))
+BT_PRINTER_WIDTH = int(os.getenv("BT_PRINTER_WIDTH", "384"))
 
 HX711_DOUT_PIN = int(os.getenv("HX711_DOUT_PIN", "5"))
 HX711_SCK_PIN = int(os.getenv("HX711_SCK_PIN", "6"))
@@ -953,52 +957,200 @@ class TFTDisplay:
 
 # ── Receipt Printer ──────────────────────────────────────────────────────────
 class ReceiptPrinter:
+    _PRINT_ROW_CMD = 0xA2
+    _FEED_PAPER_CMD = 0xA1
+    _PRINTER_FONT_CANDIDATES = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    ]
+
     def __init__(self, mac_address: str):
         self._printer = None
+        self._mode = None
+        self._mac_address = mac_address
+
         if not mac_address:
             logger.warning("Bluetooth printer MAC not configured; skipping printer init")
             return
-        if not _BLUETOOTH_PRINTER_AVAILABLE:
-            logger.warning("python-escpos not found; receipt printing disabled")
+
+        if _BLUETOOTH_PRINTER_AVAILABLE and BTWPrinter is not None:
+            try:
+                self._printer = BTWPrinter(mac_address)
+                self._mode = "escpos"
+                logger.info("Bluetooth printer initialized via escpos: %s", mac_address)
+                return
+            except Exception as exc:
+                logger.warning("escpos Bluetooth init failed (%s), trying raw Bluetooth mode", exc)
+
+        if hasattr(socket, "AF_BLUETOOTH") and Image is not None and ImageDraw is not None and ImageFont is not None:
+            self._mode = "raw_bt"
+            logger.info("Bluetooth printer initialized via raw RFCOMM image mode: %s", mac_address)
             return
+
+        logger.warning("No compatible Bluetooth printer backend available; receipt printing disabled")
+
+    @staticmethod
+    def _crc8(data: list[int]) -> int:
+        crc = 0
+        for byte in data:
+            crc ^= (byte & 0xFF)
+            for _ in range(8):
+                if crc & 0x80:
+                    crc = ((crc << 1) ^ 0x07) & 0xFF
+                else:
+                    crc = (crc << 1) & 0xFF
+        return crc & 0xFF
+
+    @classmethod
+    def _make_packet(cls, cmd: int, data: list[int]) -> bytes:
+        payload = [int(v) & 0xFF for v in data]
+        return bytes([0x51, 0x78, cmd & 0xFF, 0x00, len(payload), 0x00] + payload + [cls._crc8(payload), 0xFF])
+
+    @classmethod
+    def _load_printer_font(cls, size: int):
+        for path in cls._PRINTER_FONT_CANDIDATES:
+            if os.path.exists(path):
+                try:
+                    return ImageFont.truetype(path, size)
+                except Exception:
+                    continue
         try:
-            self._printer = BTWPrinter(mac_address)
-            logger.info("Bluetooth printer initialized: %s", mac_address)
-        except Exception as exc:
-            logger.error("Printer init failed: %s", exc)
-            self._printer = None
+            return ImageFont.load_default(size=size)
+        except TypeError:
+            return ImageFont.load_default()
+
+    def _build_receipt_image(self, session_id: str, cart: SessionCart, total: float, payment_ref: str):
+        lines = [
+            SHOP_NAME,
+            "=" * 32,
+            f"Receipt: {session_id}",
+            f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "=" * 32,
+            "",
+        ]
+
+        for item in cart.items.values():
+            lines.append(f"{item.name[:20]} x{item.quantity}")
+            lines.append(f"  INR {item.price:.2f} = INR {item.line_total():.2f}")
+
+        tax = cart.subtotal * 0.18
+        lines.extend(
+            [
+                "",
+                "-" * 32,
+                f"Subtotal: INR {cart.subtotal:.2f}",
+                f"GST @18%: INR {tax:.2f}",
+                f"TOTAL: INR {total:.2f}",
+                "=" * 32,
+                f"Payment: {payment_ref}",
+                "",
+                "Thank you for shopping!",
+                "",
+            ]
+        )
+
+        width = max(128, BT_PRINTER_WIDTH)
+        margin_x = 8
+        top_margin = 8
+        bottom_margin = 12
+        line_gap = 6
+        font = self._load_printer_font(24)
+
+        line_height = (font.getbbox("Hg")[3] - font.getbbox("Hg")[1]) + line_gap
+        height = top_margin + (len(lines) * line_height) + bottom_margin
+
+        image = Image.new("L", (width, height), 255)
+        draw = ImageDraw.Draw(image)
+
+        y = top_margin
+        for line in lines:
+            draw.text((margin_x, y), line, fill=0, font=font)
+            y += line_height
+
+        return image.point(lambda x: 0 if x < 128 else 255).convert("1")
+
+    def _send_image_raw_bluetooth(self, image) -> None:
+        image_l = image.convert("L")
+        packets: list[bytes] = []
+
+        for y in range(image_l.height):
+            row_bytes: list[int] = []
+            for x in range(0, BT_PRINTER_WIDTH, 8):
+                value = 0
+                for bit in range(8):
+                    xx = x + bit
+                    px = 255
+                    if xx < image_l.width:
+                        px = image_l.getpixel((xx, y))
+                    if px < 128:
+                        value |= (1 << (7 - bit))
+                row_bytes.append(value)
+            packets.append(self._make_packet(self._PRINT_ROW_CMD, row_bytes))
+
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+            sock.connect((self._mac_address, BT_PRINTER_CHANNEL))
+            time.sleep(0.6)
+            for packet in packets:
+                sock.send(packet)
+                if BT_PRINTER_ROW_DELAY_SECONDS > 0:
+                    time.sleep(BT_PRINTER_ROW_DELAY_SECONDS)
+            sock.send(self._make_packet(self._FEED_PAPER_CMD, [0x32, 0x00]))
+            time.sleep(0.8)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def _print_receipt_raw_bt(self, session_id: str, cart: SessionCart, total: float, payment_ref: str) -> None:
+        image = self._build_receipt_image(session_id, cart, total, payment_ref)
+        self._send_image_raw_bluetooth(image)
 
     def print_receipt(self, session_id: str, cart: SessionCart, total: float, payment_ref: str):
         """Print a receipt for the transaction."""
-        if not self._printer:
+        if self._mode is None:
             logger.warning("No printer available; skipping receipt for %s", session_id)
             return
+
         try:
-            self._printer.text(f"{SHOP_NAME}\n")
-            self._printer.text("=" * 32 + "\n")
-            self._printer.text(f"Receipt: {session_id}\n")
-            self._printer.text(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            self._printer.text("=" * 32 + "\n\n")
+            if self._mode == "escpos" and self._printer is not None:
+                self._printer.text(f"{SHOP_NAME}\n")
+                self._printer.text("=" * 32 + "\n")
+                self._printer.text(f"Receipt: {session_id}\n")
+                self._printer.text(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                self._printer.text("=" * 32 + "\n\n")
 
-            for item in cart.items.values():
-                self._printer.text(f"{item.name[:20]:<20}\n")
-                self._printer.text(f"  {item.quantity}x ₹{item.price:.2f} = ₹{item.line_total():.2f}\n")
+                for item in cart.items.values():
+                    self._printer.text(f"{item.name[:20]:<20}\n")
+                    self._printer.text(f"  {item.quantity}x INR {item.price:.2f} = INR {item.line_total():.2f}\n")
 
-            self._printer.text("\n" + "-" * 32 + "\n")
-            self._printer.text(f"{'Subtotal':<20} ₹{cart.subtotal:.2f}\n")
-            tax = cart.subtotal * 0.18
-            self._printer.text(f"{'GST @18%':<20} ₹{tax:.2f}\n")
-            self._printer.text(f"{'TOTAL':<20} ₹{total:.2f}\n")
-            self._printer.text("=" * 32 + "\n")
-            self._printer.text(f"Payment: {payment_ref}\n")
-            self._printer.text("\nThank you for shopping!\n\n")
-            self._printer.cut()
+                self._printer.text("\n" + "-" * 32 + "\n")
+                self._printer.text(f"{'Subtotal':<20} INR {cart.subtotal:.2f}\n")
+                tax = cart.subtotal * 0.18
+                self._printer.text(f"{'GST @18%':<20} INR {tax:.2f}\n")
+                self._printer.text(f"{'TOTAL':<20} INR {total:.2f}\n")
+                self._printer.text("=" * 32 + "\n")
+                self._printer.text(f"Payment: {payment_ref}\n")
+                self._printer.text("\nThank you for shopping!\n\n")
+                self._printer.cut()
+            elif self._mode == "raw_bt":
+                self._print_receipt_raw_bt(session_id, cart, total, payment_ref)
+            else:
+                logger.warning("No compatible printer backend active; skipping receipt for %s", session_id)
+                return
+
             logger.info("Receipt printed for %s", session_id)
         except Exception as exc:
             logger.error("Receipt print failed: %s", exc)
 
     def close(self) -> None:
-        if not self._printer:
+        if self._mode != "escpos" or not self._printer:
             return
         try:
             if hasattr(self._printer, "close"):
