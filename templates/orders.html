@@ -1,0 +1,73 @@
+{% extends "base_admin.html" %}
+
+{% block title %}Orders - Smart Trolley Admin{% endblock %}
+
+{% block content %}
+<section class="page-head">
+    <h2 class="page-title">Order History</h2>
+    <p class="page-note">Showing all transactions, newest first.</p>
+</section>
+
+<section class="panel">
+    {% if orders %}
+    <div class="table-wrap">
+        <table class="responsive-table">
+            <thead>
+                <tr>
+                    <th>Bill No</th>
+                    <th>Date and Time</th>
+                    <th>Items</th>
+                    <th class="text-right">Total</th>
+                    <th>Status</th>
+                    <th class="hide-tablet">Payment Ref</th>
+                    <th class="text-center">Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for order in orders %}
+                <tr>
+                    <td data-label="Bill No" class="code">{{ order.bill_no }}</td>
+                    <td data-label="Date and Time">
+                        {% if order.created_at %}
+                            {{ order.created_at.strftime('%d/%m/%Y %H:%M') }}
+                        {% else %}
+                            -
+                        {% endif %}
+                    </td>
+                    <td data-label="Items">{{ order.items_count }}</td>
+                    <td data-label="Total" class="text-right">₹{{ '%.2f'|format(order.total_amount|float) }}</td>
+                    <td data-label="Status">
+                        <span class="badge {% if (order.payment_status or '')|lower == 'paid' %}paid{% else %}pending{% endif %}">
+                            {{ order.payment_status or 'pending' }}
+                        </span>
+                    </td>
+                    <td data-label="Payment Ref" class="hide-tablet code">{{ order.payment_ref_short }}</td>
+                    <td data-label="Action" class="text-center">
+                        <a class="btn link small" href="{{ url_for('admin_order_detail', session_id=order.session_id) }}">View Details</a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <div class="pagination">
+        {% if page > 1 %}
+            <a href="{{ url_for('admin_orders', page=page-1) }}" class="btn muted">Previous</a>
+        {% else %}
+            <span class="btn muted" style="opacity:0.45;pointer-events:none;">Previous</span>
+        {% endif %}
+
+        <span class="page-label">Page {{ page }} of {{ total_pages }} ({{ total_orders }} orders)</span>
+
+        {% if page < total_pages %}
+            <a href="{{ url_for('admin_orders', page=page+1) }}" class="btn muted">Next</a>
+        {% else %}
+            <span class="btn muted" style="opacity:0.45;pointer-events:none;">Next</span>
+        {% endif %}
+    </div>
+    {% else %}
+        <div class="empty">No transactions found yet.</div>
+    {% endif %}
+</section>
+{% endblock %}

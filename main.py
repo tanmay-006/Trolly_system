@@ -136,6 +136,7 @@ BLUETOOTH_PRINTER_MAC = os.getenv("BLUETOOTH_PRINTER_MAC", "").strip()
 BT_PRINTER_CHANNEL = int(os.getenv("BT_PRINTER_CHANNEL", "1"))
 BT_PRINTER_ROW_DELAY_SECONDS = float(os.getenv("BT_PRINTER_ROW_DELAY_SECONDS", "0.005"))
 BT_PRINTER_WIDTH = int(os.getenv("BT_PRINTER_WIDTH", "384"))
+LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD", "5"))
 
 HX711_DOUT_PIN = int(os.getenv("HX711_DOUT_PIN", "5"))
 HX711_SCK_PIN = int(os.getenv("HX711_SCK_PIN", "6"))
@@ -249,7 +250,7 @@ def get_product_by_barcode(barcode: str) -> dict | None:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT barcode, name, price, category, weight_grams
+                SELECT barcode, name, price, category, weight_grams, stock
                 FROM products
                 WHERE barcode = %s
                 LIMIT 1
@@ -322,11 +323,21 @@ def mark_transaction_paid(
                 SET payment_status = 'paid',
                     upi_ref = %s,
                     razorpay_order_id = %s,
-                    razorpay_qr_id = %s
+                    razorpay_qr_id = %s,
+                    items = %s::jsonb,
+                    total_amount = %s,
+                    payment_method = 'UPI'
                 WHERE session_id = %s
                 RETURNING id
                 """,
-                (payment_id, razorpay_order_id, razorpay_qr_id, session_id),
+                (
+                    payment_id,
+                    razorpay_order_id,
+                    razorpay_qr_id,
+                    json.dumps(items),
+                    total,
+                    session_id,
+                ),
             )
             row = cur.fetchone()
             if row:
@@ -343,6 +354,43 @@ def mark_transaction_paid(
         razorpay_order_id=razorpay_order_id,
         razorpay_qr_id=razorpay_qr_id,
     )
+
+
+def decrement_stock(cart_items: list[dict]) -> None:
+    """Atomically decrement stock for purchased items; rollback on any failure."""
+    if not cart_items:
+        return
+
+    with get_db() as conn:
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    for item in cart_items:
+                        barcode = str(item.get("id") or item.get("barcode") or "").strip()
+                        name = str(item.get("name") or barcode)
+                        qty = int(item.get("quantity") or item.get("qty") or 0)
+                        if not barcode or qty <= 0:
+                            continue
+
+                        cur.execute(
+                            """
+                            UPDATE products
+                            SET stock = stock - %s,
+                                updated_at = NOW()
+                            WHERE barcode = %s
+                              AND stock >= %s
+                            """,
+                            (qty, barcode, qty),
+                        )
+                        if cur.rowcount == 0:
+                            raise RuntimeError(
+                                f"Stock update failed for '{name}' (barcode: {barcode}) - insufficient stock or not found"
+                            )
+                        logger.info("[STOCK] Decremented: '%s' -%d units", name, qty)
+            logger.info("[STOCK] All %d items decremented successfully", len(cart_items))
+        except Exception as exc:
+            logger.error("[STOCK] Decrement transaction rolled back: %s", exc)
+            raise
 
 
 # ── Data Models ──────────────────────────────────────────────────────────────
@@ -778,6 +826,7 @@ class TFTDisplay:
         price: float,
         qty: int,
         weight: float | int | None,
+        stock_level: int | None,
         unique_items: int,
         total_qty: int,
         subtotal: float,
@@ -785,7 +834,14 @@ class TFTDisplay:
         img, draw = self._blank("#1a1a2e")
 
         self._draw_camera_indicator(draw, camera_ready)
-        draw.text((6, 3), "✓ ADDED", font=_load_font(14), fill=GREEN)
+        if stock_level is not None and stock_level <= 0:
+            draw.rectangle([(0, 0), (TFT_WIDTH, 20)], fill=DK_RED)
+            draw.text((6, 3), "OUT OF STOCK", font=_load_font(12), fill=WHITE)
+        elif stock_level is not None and stock_level <= LOW_STOCK_THRESHOLD:
+            draw.rectangle([(0, 0), (TFT_WIDTH, 20)], fill="#594100")
+            draw.text((6, 3), f"LOW STOCK: {stock_level}", font=_load_font(12), fill=YELLOW)
+        else:
+            draw.text((6, 3), "ADDED", font=_load_font(14), fill=GREEN)
         draw.line([(0, 22), (TFT_WIDTH, 22)], fill=GREY, width=1)
 
         short = (product_name[:18] + "…") if len(product_name) > 18 else product_name
@@ -793,8 +849,23 @@ class TFTDisplay:
         draw.text((6, 46), f"₹{price:.2f}", font=_load_font(16), fill=YELLOW)
         draw.text((6, 66), f"Qty in cart: {qty}", font=_load_font(11, bold=False), fill=WHITE)
 
+        if stock_level is None:
+            stock_text = "Stock: -"
+            stock_fill = LT_GREY
+        elif stock_level <= 0:
+            stock_text = "OUT OF STOCK"
+            stock_fill = RED
+        elif stock_level <= LOW_STOCK_THRESHOLD:
+            stock_text = f"Only {stock_level} left"
+            stock_fill = YELLOW
+        else:
+            stock_text = f"Stock: {stock_level}"
+            stock_fill = LT_GREY
+
+        draw.text((6, 82), stock_text, font=_load_font(10, bold=False), fill=stock_fill)
+
         weight_txt = "-" if weight is None else str(int(weight))
-        draw.text((6, 82), f"Weight: {weight_txt}g", font=_load_font(10, bold=False), fill=WHITE)
+        draw.text((6, 94), f"Weight: {weight_txt}g", font=_load_font(9, bold=False), fill=WHITE)
 
         self._draw_cart_footer(draw, unique_items, total_qty, subtotal)
         return img
@@ -880,6 +951,7 @@ class TFTDisplay:
         total_qty: int,
         subtotal: float,
         weight: float | int | None = None,
+        stock_level: int | None = None,
     ):
         """STAGE 2: Product found and added."""
         if not _DISPLAY_AVAILABLE or not self._device:
@@ -892,6 +964,7 @@ class TFTDisplay:
                 price,
                 qty,
                 weight,
+                stock_level,
                 unique_items,
                 total_qty,
                 subtotal,
@@ -1862,6 +1935,18 @@ def main() -> int:
             )
             logger.info("[PAYMENT] DB updated - status: paid | ref: %s | tx=%d", payment_id, tx_id)
 
+            is_test_mode = payment_id.startswith("TEST_SKIP_")
+            if is_test_mode:
+                logger.warning("[STOCK] Testing mode - stock NOT decremented for skip payment")
+            else:
+                try:
+                    decrement_stock(cart.to_list())
+                except Exception as exc:
+                    logger.error("[STOCK] Failed to decrement stock: %s", exc)
+                    camera_now = scanner.is_camera_ready()
+                    display.show_processing_message(camera_now, "Stock sync error", "Check admin panel")
+                    _sleep_with_button_handling(1.0)
+
             camera_now = scanner.is_camera_ready()
             display.show_payment_success(camera_now, final_total, payment_id)
             _sleep_with_button_handling(2.0)
@@ -2276,6 +2361,16 @@ def main() -> int:
                     product.get("stock", "N/A"),
                 )
 
+                stock_level = int(product.get("stock") or 0)
+                if stock_level <= 0:
+                    logger.warning("[STOCK] OUT OF STOCK: '%s'", product.get("name"))
+                elif stock_level <= LOW_STOCK_THRESHOLD:
+                    logger.warning(
+                        "[STOCK] Low stock warning: '%s' - %d remaining",
+                        product.get("name"),
+                        stock_level,
+                    )
+
             # Add to cart
                 was_already_in_cart = barcode in cart.items
                 name, qty = cart.add(product)
@@ -2326,6 +2421,7 @@ def main() -> int:
                         cart.total_quantity,
                         cart.subtotal,
                         expected_weight,
+                        stock_level,
                     )
                     _sleep_with_button_handling(2.5)
 

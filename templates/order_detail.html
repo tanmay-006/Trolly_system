@@ -1,0 +1,78 @@
+{% extends "base_admin.html" %}
+
+{% block title %}Order Details - Smart Trolley Admin{% endblock %}
+
+{% block content %}
+<section class="page-head">
+    <h2 class="page-title">Order Details</h2>
+    <p class="page-note">Session {{ order.session_id }}</p>
+</section>
+
+<section class="summary-grid">
+    <article class="summary-card">
+        <p class="summary-label">Bill No</p>
+        <p class="summary-value code">{{ order.session_id[-8:] if order.session_id else '-' }}</p>
+    </article>
+    <article class="summary-card">
+        <p class="summary-label">Date</p>
+        <p class="summary-value">
+            {% if order.created_at %}
+                {{ order.created_at.strftime('%d/%m/%Y %H:%M') }}
+            {% else %}
+                -
+            {% endif %}
+        </p>
+    </article>
+    <article class="summary-card">
+        <p class="summary-label">Payment Ref</p>
+        <p class="summary-value code">{{ payment_ref_short }}</p>
+    </article>
+    <article class="summary-card">
+        <p class="summary-label">Total</p>
+        <p class="summary-value">₹{{ '%.2f'|format(order.total_amount|float) }}</p>
+    </article>
+</section>
+
+<section class="panel">
+    {% if items %}
+    <div class="table-wrap">
+        <table class="responsive-table">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Qty</th>
+                    <th class="text-right">Unit Price</th>
+                    <th class="text-right">Line Total</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for item in items %}
+                <tr>
+                    <td data-label="Name">{{ item.name }}</td>
+                    <td data-label="Qty">{{ item.qty }}</td>
+                    <td data-label="Unit Price" class="text-right">₹{{ '%.2f'|format(item.unit_price|float) }}</td>
+                    <td data-label="Line Total" class="text-right">₹{{ '%.2f'|format(item.line_total|float) }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <div class="toolbar" style="margin-top:14px;">
+        <div class="toolbar-row">
+            <span class="page-label">Item count: {{ item_count }}</span>
+            <span class="page-label">Subtotal: ₹{{ '%.2f'|format(subtotal|float) }}</span>
+            <span class="page-label">Total: ₹{{ '%.2f'|format(order.total_amount|float) }}</span>
+        </div>
+        <div class="toolbar-row">
+            <a class="btn muted" href="{{ url_for('admin_orders') }}">Back to Orders</a>
+        </div>
+    </div>
+    {% else %}
+        <div class="empty">No item data found for this transaction.</div>
+        <div class="toolbar" style="margin-top:14px;">
+            <a class="btn muted" href="{{ url_for('admin_orders') }}">Back to Orders</a>
+        </div>
+    {% endif %}
+</section>
+{% endblock %}

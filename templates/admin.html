@@ -1,212 +1,157 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Panel — Smart Trolley</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-    <style>
-        .fade-in { animation: fadeIn 0.3s ease-in; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-    </style>
-</head>
-<body class="bg-gray-100 min-h-screen">
+{% extends "base_admin.html" %}
 
-    <!-- Header -->
-    <header class="bg-indigo-700 text-white shadow-lg">
-        <div class="container mx-auto px-4 py-4 flex items-center justify-between">
-            <div class="flex items-center space-x-3">
-                <i class="fas fa-cogs text-2xl"></i>
-                <div>
-                    <h1 class="text-xl font-bold">Smart Trolley Admin</h1>
-                    <p class="text-indigo-200 text-xs">Product Catalog Management</p>
-                </div>
-            </div>
-            <a href="/" class="bg-indigo-600 hover:bg-indigo-500 px-4 py-2 rounded-lg text-sm transition">
-                <i class="fas fa-cash-register mr-2"></i>POS Dashboard
-            </a>
-        </div>
-    </header>
+{% block title %}Products - Smart Trolley Admin{% endblock %}
 
-    <main class="container mx-auto px-4 py-8">
-        <div class="grid grid-cols-1 xl:grid-cols-3 gap-8">
+{% block content %}
+<section class="page-head">
+    <h2 class="page-title">Inventory Management</h2>
+    <p class="page-note">Real-time stock visibility with low and out-of-stock alerts.</p>
+</section>
 
-            <!-- ── Add / Edit Product Form ── -->
-            <div class="xl:col-span-1">
-                <div class="bg-white rounded-xl shadow-md p-6 fade-in">
-                    <h2 class="text-lg font-bold text-gray-800 mb-5">
-                        <i class="fas fa-plus-circle text-green-500 mr-2"></i>Add / Update Product
-                    </h2>
-                    <form action="/admin/add" method="POST" id="addForm" class="space-y-4">
+<section class="stat-grid">
+    <article class="stat-card">
+        <p class="stat-label">Today's Sales</p>
+        <p class="stat-value">₹{{ '%.2f'|format(stats.today_sales|float) }}</p>
+    </article>
+    <article class="stat-card">
+        <p class="stat-label">Today's Orders</p>
+        <p class="stat-value">{{ stats.today_orders }}</p>
+    </article>
+    <article class="stat-card">
+        <p class="stat-label">Total Products</p>
+        <p class="stat-value">{{ stats.total_products }}</p>
+    </article>
+    <article class="stat-card">
+        <p class="stat-label">Low Stock</p>
+        <p class="stat-value">{{ stats.low_stock_items }}</p>
+    </article>
+    <article class="stat-card">
+        <p class="stat-label">Out of Stock</p>
+        <p class="stat-value">{{ stats.out_of_stock_items }}</p>
+    </article>
+</section>
 
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Barcode <span class="text-red-500">*</span></label>
-                            <input type="text" name="barcode" id="barcode" required
-                                   placeholder="e.g. 1011"
-                                   class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm">
-                            <p class="text-xs text-gray-500 mt-1">If barcode already exists, the product is updated.</p>
-                        </div>
-
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Product Name <span class="text-red-500">*</span></label>
-                            <input type="text" name="name" id="name" required
-                                   placeholder="e.g. Wireless Earbuds"
-                                   class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm">
-                        </div>
-
-                        <div class="grid grid-cols-2 gap-3">
-                            <div>
-                                <label class="block text-sm font-medium text-gray-700 mb-1">Price (₹) <span class="text-red-500">*</span></label>
-                                <input type="number" name="price" id="price" required min="0.01" step="0.01"
-                                       placeholder="1299.00"
-                                       class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm">
-                            </div>
-                            <div>
-                                <label class="block text-sm font-medium text-gray-700 mb-1">Weight (g)</label>
-                                <input type="number" name="weight_grams" id="weight_grams" min="0"
-                                       placeholder="250"
-                                       class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm">
-                            </div>
-                        </div>
-
-                        <div class="grid grid-cols-2 gap-3">
-                            <div>
-                                <label class="block text-sm font-medium text-gray-700 mb-1">Category</label>
-                                <input type="text" name="category" id="category"
-                                       list="categoryOptions" placeholder="Electronics"
-                                       class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm">
-                                <datalist id="categoryOptions">
-                                    {% set cats = products | map(attribute='category') | unique | list %}
-                                    {% for cat in cats %}<option value="{{ cat }}">{% endfor %}
-                                    <option value="Electronics">
-                                    <option value="Accessories">
-                                    <option value="Food">
-                                    <option value="General">
-                                </datalist>
-                            </div>
-                            <div>
-                                <label class="block text-sm font-medium text-gray-700 mb-1">Stock</label>
-                                <input type="number" name="stock" id="stock" min="0" value="0"
-                                       class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm">
-                            </div>
-                        </div>
-
-                        <button type="submit"
-                                class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2.5 rounded-lg transition">
-                            <i class="fas fa-save mr-2"></i>Save Product
-                        </button>
-                        <button type="button" onclick="clearForm()"
-                                class="w-full bg-gray-200 hover:bg-gray-300 text-gray-700 font-medium py-2 rounded-lg transition text-sm">
-                            <i class="fas fa-times mr-2"></i>Clear Form
-                        </button>
-                    </form>
-                </div>
+<section class="layout-grid">
+    <aside class="panel">
+        <h3 class="panel-title">Add or Update Product</h3>
+        <form action="{{ url_for('admin_add_product') }}" method="POST" id="addForm" class="form-grid">
+            <div class="field full">
+                <label for="barcode">Barcode</label>
+                <input type="text" id="barcode" name="barcode" required placeholder="e.g. 1011">
+                <p class="form-note">Existing barcode updates product details.</p>
             </div>
 
-            <!-- ── Product Table ── -->
-            <div class="xl:col-span-2">
-                <div class="bg-white rounded-xl shadow-md p-6 fade-in">
-                    <div class="flex items-center justify-between mb-5">
-                        <h2 class="text-lg font-bold text-gray-800">
-                            <i class="fas fa-box-open text-indigo-500 mr-2"></i>Products
-                            <span class="ml-2 bg-indigo-100 text-indigo-700 text-xs font-semibold px-2.5 py-0.5 rounded-full">{{ products|length }}</span>
-                        </h2>
-                        <div class="relative">
-                            <i class="fas fa-search absolute left-3 top-2.5 text-gray-400 text-sm"></i>
-                            <input type="text" id="searchInput" placeholder="Search products…"
-                                   onkeyup="filterTable()"
-                                   class="pl-9 pr-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm">
-                        </div>
-                    </div>
+            <div class="field full">
+                <label for="name">Name</label>
+                <input type="text" id="name" name="name" required placeholder="Product name">
+            </div>
 
-                    {% if products %}
-                    <div class="overflow-x-auto">
-                        <table class="w-full text-sm" id="productTable">
-                            <thead>
-                                <tr class="bg-gray-50 border-b text-left text-xs text-gray-500 uppercase tracking-wider">
-                                    <th class="px-4 py-3">Barcode</th>
-                                    <th class="px-4 py-3">Name</th>
-                                    <th class="px-4 py-3">Category</th>
-                                    <th class="px-4 py-3 text-right">Price</th>
-                                    <th class="px-4 py-3 text-center">Stock</th>
-                                    <th class="px-4 py-3 text-center">Weight</th>
-                                    <th class="px-4 py-3 text-center">Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody class="divide-y divide-gray-100">
-                                {% for p in products %}
-                                <tr class="hover:bg-gray-50 transition product-row">
-                                    <td class="px-4 py-3 font-mono text-gray-600">{{ p.barcode }}</td>
-                                    <td class="px-4 py-3 font-medium text-gray-900">{{ p.name }}</td>
-                                    <td class="px-4 py-3">
-                                        <span class="bg-indigo-100 text-indigo-700 text-xs px-2 py-0.5 rounded-full">{{ p.category or '—' }}</span>
-                                    </td>
-                                    <td class="px-4 py-3 text-right font-semibold text-green-700">₹{{ "%.2f"|format(p.price|float) }}</td>
-                                    <td class="px-4 py-3 text-center">
-                                        {% if p.stock == 0 %}
-                                            <span class="text-red-500 font-medium">0</span>
-                                        {% else %}
-                                            <span class="text-gray-700">{{ p.stock }}</span>
-                                        {% endif %}
-                                    </td>
-                                    <td class="px-4 py-3 text-center text-gray-500">
-                                        {{ p.weight_grams ~ ' g' if p.weight_grams else '—' }}
-                                    </td>
-                                    <td class="px-4 py-3 text-center">
-                                        <div class="flex items-center justify-center space-x-2">
-                                            <button onclick="fillForm('{{ p.barcode }}','{{ p.name }}','{{ p.price }}','{{ p.weight_grams or '' }}','{{ p.category or '' }}','{{ p.stock }}')"
-                                                    class="text-indigo-600 hover:text-indigo-800 transition" title="Edit">
-                                                <i class="fas fa-pen text-sm"></i>
-                                            </button>
-                                            <form action="/admin/delete/{{ p.barcode }}" method="POST"
-                                                  onsubmit="return confirm('Delete {{ p.name }}?')">
-                                                <button type="submit"
-                                                        class="text-red-500 hover:text-red-700 transition" title="Delete">
-                                                    <i class="fas fa-trash-alt text-sm"></i>
-                                                </button>
-                                            </form>
-                                        </div>
-                                    </td>
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                    {% else %}
-                    <div class="text-center py-16 text-gray-400">
-                        <i class="fas fa-box-open text-5xl mb-4"></i>
-                        <p class="text-lg font-medium">No products yet</p>
-                        <p class="text-sm">Add your first product using the form.</p>
-                    </div>
-                    {% endif %}
-                </div>
+            <div class="field">
+                <label for="price">Price (₹)</label>
+                <input type="number" id="price" name="price" min="0.01" step="0.01" required>
+            </div>
+
+            <div class="field">
+                <label for="weight_grams">Weight (g)</label>
+                <input type="number" id="weight_grams" name="weight_grams" min="0">
+            </div>
+
+            <div class="field">
+                <label for="category">Category</label>
+                <input type="text" id="category" name="category" list="categoryOptions" placeholder="General">
+                <datalist id="categoryOptions">
+                    {% set cats = products | map(attribute='category') | unique | list %}
+                    {% for cat in cats %}
+                        {% if cat %}<option value="{{ cat }}">{% endif %}
+                    {% endfor %}
+                    <option value="Electronics">
+                    <option value="Accessories">
+                    <option value="Food">
+                    <option value="General">
+                </datalist>
+            </div>
+
+            <div class="field">
+                <label for="stock">Stock</label>
+                <input type="number" id="stock" name="stock" min="0" value="0">
+            </div>
+
+            <div class="field full">
+                <button type="submit" class="btn primary">Save Product</button>
+            </div>
+            <div class="field full">
+                <button type="button" class="btn muted" onclick="clearForm()">Clear Form</button>
+            </div>
+        </form>
+    </aside>
+
+    <section class="panel">
+        <h3 class="panel-title">Products</h3>
+
+        <div class="toolbar">
+            <div class="toolbar-row">
+                <button class="filter-btn active" type="button" data-stock-filter="all">All</button>
+                <button class="filter-btn" type="button" data-stock-filter="in">In Stock</button>
+                <button class="filter-btn" type="button" data-stock-filter="low">Low Stock</button>
+                <button class="filter-btn" type="button" data-stock-filter="out">Out of Stock</button>
+            </div>
+            <div class="toolbar-row">
+                <input type="text" id="searchInput" placeholder="Search products">
             </div>
         </div>
-    </main>
 
-    <script>
-        function filterTable() {
-            const q = document.getElementById('searchInput').value.toLowerCase();
-            document.querySelectorAll('.product-row').forEach(row => {
-                row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
-            });
-        }
-
-        function fillForm(barcode, name, price, weight, category, stock) {
-            document.getElementById('barcode').value    = barcode;
-            document.getElementById('name').value       = name;
-            document.getElementById('price').value      = price;
-            document.getElementById('weight_grams').value = weight;
-            document.getElementById('category').value   = category;
-            document.getElementById('stock').value      = stock;
-            document.getElementById('addForm').scrollIntoView({ behavior: 'smooth' });
-            document.getElementById('name').focus();
-        }
-
-        function clearForm() {
-            document.getElementById('addForm').reset();
-        }
-    </script>
-</body>
-</html>
+        {% if products %}
+        <div class="table-wrap">
+            <table class="responsive-table" id="productTable">
+                <thead>
+                    <tr>
+                        <th class="hide-tablet">Barcode</th>
+                        <th>Name</th>
+                        <th class="hide-tablet">Category</th>
+                        <th class="text-right">Price</th>
+                        <th>Stock</th>
+                        <th class="hide-tablet">Weight</th>
+                        <th class="text-center">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for p in products %}
+                    <tr class="product-row" data-stock-state="{{ p.stock_status }}">
+                        <td data-label="Barcode" class="code hide-tablet">{{ p.barcode }}</td>
+                        <td data-label="Name">{{ p.name }}</td>
+                        <td data-label="Category" class="hide-tablet">{{ p.category or '-' }}</td>
+                        <td data-label="Price" class="text-right">₹{{ '%.2f'|format(p.price|float) }}</td>
+                        <td data-label="Stock">
+                            {% if p.stock_status == 'out' %}
+                                <span class="badge out">Out of Stock ({{ p.stock_value }})</span>
+                            {% elif p.stock_status == 'low' %}
+                                <span class="badge low">Low ({{ p.stock_value }})</span>
+                            {% else %}
+                                <span class="badge in">In Stock ({{ p.stock_value }})</span>
+                            {% endif %}
+                        </td>
+                        <td data-label="Weight" class="hide-tablet">{{ p.weight_grams ~ ' g' if p.weight_grams else '-' }}</td>
+                        <td data-label="Actions" class="text-center">
+                            <span class="row-actions">
+                                <button
+                                    type="button"
+                                    class="btn link small"
+                                    onclick='fillForm({{ p.barcode|tojson }}, {{ p.name|tojson }}, {{ ("%.2f"|format(p.price|float))|tojson }}, {{ (p.weight_grams if p.weight_grams is not none else "")|tojson }}, {{ (p.category if p.category else "")|tojson }}, {{ p.stock_value|tojson }})'>
+                                    Edit
+                                </button>
+                                <form action="{{ url_for('admin_delete_product', barcode=p.barcode) }}" method="POST" onsubmit="return confirm('Delete {{ p.name }}?');">
+                                    <button type="submit" class="btn link small">Delete</button>
+                                </form>
+                            </span>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+            <div class="empty">No products available yet.</div>
+        {% endif %}
+    </section>
+</section>
+{% endblock %}

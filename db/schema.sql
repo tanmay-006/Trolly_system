@@ -33,6 +33,10 @@ ALTER TABLE transactions
 ALTER TABLE transactions
     ADD COLUMN IF NOT EXISTS razorpay_qr_id TEXT;
 
+CREATE INDEX IF NOT EXISTS idx_transactions_session ON transactions(session_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_created ON transactions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_products_stock ON products(stock);
+
 -- Auto-update updated_at on products rows
 CREATE OR REPLACE FUNCTION set_updated_at()
 RETURNS TRIGGER AS $$

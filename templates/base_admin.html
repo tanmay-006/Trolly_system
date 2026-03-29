@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Smart Trolley Admin{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}">
+</head>
+<body>
+    <header class="top-nav">
+        <div class="nav-inner">
+            <div class="brand">
+                <div>
+                    <h1 class="brand-title">Smart Trolley Admin</h1>
+                    <p class="brand-sub">Inventory and order control</p>
+                </div>
+            </div>
+            <button class="menu-toggle" id="menuToggle" aria-label="Toggle menu">☰</button>
+            <nav class="nav-links" id="navLinks">
+                <a href="{{ url_for('admin_products') }}" class="nav-link {% if active_page == 'products' %}active{% endif %}">Products</a>
+                <a href="{{ url_for('admin_orders') }}" class="nav-link {% if active_page == 'orders' %}active{% endif %}">Orders</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="app-shell">
+        {% block content %}{% endblock %}
+    </main>
+
+    <script src="{{ url_for('static', filename='admin.js') }}"></script>
+</body>
+</html>
