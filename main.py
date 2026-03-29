@@ -1935,17 +1935,15 @@ def main() -> int:
             )
             logger.info("[PAYMENT] DB updated - status: paid | ref: %s | tx=%d", payment_id, tx_id)
 
-            is_test_mode = payment_id.startswith("TEST_SKIP_")
-            if is_test_mode:
-                logger.warning("[STOCK] Testing mode - stock NOT decremented for skip payment")
-            else:
-                try:
-                    decrement_stock(cart.to_list())
-                except Exception as exc:
-                    logger.error("[STOCK] Failed to decrement stock: %s", exc)
-                    camera_now = scanner.is_camera_ready()
-                    display.show_processing_message(camera_now, "Stock sync error", "Check admin panel")
-                    _sleep_with_button_handling(1.0)
+            if payment_id.startswith("TEST_SKIP_"):
+                logger.warning("[STOCK] Testing mode payment - applying stock decrement")
+            try:
+                decrement_stock(cart.to_list())
+            except Exception as exc:
+                logger.error("[STOCK] Failed to decrement stock: %s", exc)
+                camera_now = scanner.is_camera_ready()
+                display.show_processing_message(camera_now, "Stock sync error", "Check admin panel")
+                _sleep_with_button_handling(1.0)
 
             camera_now = scanner.is_camera_ready()
             display.show_payment_success(camera_now, final_total, payment_id)
