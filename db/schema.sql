@@ -22,8 +22,16 @@ CREATE TABLE IF NOT EXISTS transactions (
     payment_status TEXT NOT NULL DEFAULT 'pending',   -- pending | paid | failed
     payment_method TEXT,
     upi_ref        TEXT,
+    razorpay_order_id TEXT,
+    razorpay_qr_id TEXT,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE transactions
+    ADD COLUMN IF NOT EXISTS razorpay_order_id TEXT;
+
+ALTER TABLE transactions
+    ADD COLUMN IF NOT EXISTS razorpay_qr_id TEXT;
 
 -- Auto-update updated_at on products rows
 CREATE OR REPLACE FUNCTION set_updated_at()

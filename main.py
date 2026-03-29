@@ -5,7 +5,8 @@ Integrates: camera barcode scanning, HX711 weight, TFT display,
             quantity management, checkout flow, and receipt printing.
 
 Terminal controls (placeholder for GPIO button):
-  - Type 'done' to trigger checkout
+    - Type 'done' to trigger checkout
+    - Type 'skip' to simulate payment success while payment QR is shown
   - Type 'clear' to reset cart
 """
 
@@ -74,7 +75,6 @@ try:
     from luma.core.interface.serial import spi
     from luma.lcd.device import st7735
     from PIL import Image, ImageDraw, ImageFont
-    import qrcode
     _DISPLAY_AVAILABLE = True
 except ImportError:
     _DISPLAY_AVAILABLE = False
@@ -86,12 +86,45 @@ except ImportError:
     BTWPrinter = None
     _BLUETOOTH_PRINTER_AVAILABLE = False
 
+try:
+    import qrcode
+    _QRCODE_AVAILABLE = True
+except Exception:
+    qrcode = None
+    _QRCODE_AVAILABLE = False
+
 logging.basicConfig(
     level=logging.DEBUG,
     format='[%(asctime)s] %(levelname)s — %(message)s',
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+try:
+    from payment import (
+        create_razorpay_order,
+        generate_payment_qr,
+        download_qr_image,
+        poll_payment_status,
+    )
+    _PAYMENT_MODULE_AVAILABLE = True
+    _PAYMENT_IMPORT_ERROR = None
+except Exception as exc:
+    _PAYMENT_MODULE_AVAILABLE = False
+    _PAYMENT_IMPORT_ERROR = exc
+    _PAYMENT_IMPORT_ERROR_MSG = str(exc)
+
+    def create_razorpay_order(*_args, **_kwargs):
+        raise RuntimeError(f"Payment module unavailable: {_PAYMENT_IMPORT_ERROR_MSG}")
+
+    def generate_payment_qr(*_args, **_kwargs):
+        raise RuntimeError(f"Payment module unavailable: {_PAYMENT_IMPORT_ERROR_MSG}")
+
+    def download_qr_image(*_args, **_kwargs):
+        raise RuntimeError(f"Payment module unavailable: {_PAYMENT_IMPORT_ERROR_MSG}")
+
+    def poll_payment_status(*_args, **_kwargs):
+        raise RuntimeError(f"Payment module unavailable: {_PAYMENT_IMPORT_ERROR_MSG}")
 
 # ── Configuration ────────────────────────────────────────────────────────────
 load_dotenv()
@@ -126,6 +159,23 @@ SCANNER_BUTTON_ENABLED = os.getenv("SCANNER_BUTTON_ENABLED", "1").strip().lower(
 SCANNER_BUTTON_PIN_MODE = os.getenv("SCANNER_BUTTON_PIN_MODE", "board").strip().lower()
 SCANNER_BUTTON_PIN = int(os.getenv("SCANNER_BUTTON_PIN", "11"))
 SCANNER_BUTTON_BOUNCETIME_MS = int(os.getenv("SCANNER_BUTTON_BOUNCETIME_MS", "250"))
+
+# Checkout button aliases; defaults preserve existing scanner button wiring.
+CHECKOUT_BUTTON_ENABLED = os.getenv(
+    "CHECKOUT_BUTTON_ENABLED",
+    "1" if SCANNER_BUTTON_ENABLED else "0",
+).strip().lower() in {"1", "true", "yes"}
+CHECKOUT_BUTTON_PIN_MODE = os.getenv("CHECKOUT_BUTTON_PIN_MODE", SCANNER_BUTTON_PIN_MODE).strip().lower()
+CHECKOUT_BUTTON_PIN = int(os.getenv("CHECKOUT_BUTTON_PIN", str(SCANNER_BUTTON_PIN)))
+CHECKOUT_BUTTON_BOUNCETIME_MS = int(
+    os.getenv("CHECKOUT_BUTTON_BOUNCETIME_MS", str(SCANNER_BUTTON_BOUNCETIME_MS))
+)
+
+STATE_IDLE = "idle"
+STATE_SCANNING = "scanning"
+STATE_PAYMENT = "payment"
+STATE_SUCCESS = "success"
+app_state = STATE_IDLE
 
 BOARD_TO_BCM_PIN = {
     3: 2,
@@ -212,21 +262,87 @@ def get_product_by_barcode(barcode: str) -> dict | None:
 
 def save_transaction(session_id: str, items: list, total: float,
                      status: str = "paid", payment_method: str = "UPI/QR",
-                     upi_ref: str = "") -> int:
+                     upi_ref: str = "", razorpay_order_id: str | None = None,
+                     razorpay_qr_id: str | None = None) -> int:
     """Insert a completed transaction. Returns the new row id."""
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO transactions
-                    (session_id, items, total_amount, payment_status, payment_method, upi_ref)
-                VALUES (%s, %s::jsonb, %s, %s, %s, %s)
+                    (
+                        session_id,
+                        items,
+                        total_amount,
+                        payment_status,
+                        payment_method,
+                        upi_ref,
+                        razorpay_order_id,
+                        razorpay_qr_id
+                    )
+                VALUES (%s, %s::jsonb, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
-                (session_id, json.dumps(items), total, status, payment_method, upi_ref)
+                (
+                    session_id,
+                    json.dumps(items),
+                    total,
+                    status,
+                    payment_method,
+                    upi_ref,
+                    razorpay_order_id,
+                    razorpay_qr_id,
+                )
             )
             conn.commit()
             return cur.fetchone()["id"]
+
+
+def ensure_transaction_payment_columns() -> None:
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS razorpay_order_id TEXT")
+            cur.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS razorpay_qr_id TEXT")
+        conn.commit()
+
+
+def mark_transaction_paid(
+    session_id: str,
+    payment_id: str,
+    razorpay_order_id: str,
+    razorpay_qr_id: str,
+    items: list,
+    total: float,
+) -> int:
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE transactions
+                SET payment_status = 'paid',
+                    upi_ref = %s,
+                    razorpay_order_id = %s,
+                    razorpay_qr_id = %s
+                WHERE session_id = %s
+                RETURNING id
+                """,
+                (payment_id, razorpay_order_id, razorpay_qr_id, session_id),
+            )
+            row = cur.fetchone()
+            if row:
+                conn.commit()
+                return int(row["id"])
+
+    return save_transaction(
+        session_id=session_id,
+        items=items,
+        total=total,
+        status="paid",
+        payment_method="Razorpay UPI",
+        upi_ref=payment_id,
+        razorpay_order_id=razorpay_order_id,
+        razorpay_qr_id=razorpay_qr_id,
+    )
 
 
 # ── Data Models ──────────────────────────────────────────────────────────────
@@ -884,34 +1000,179 @@ class TFTDisplay:
         except Exception as exc:
             logger.error("TFT show_cart_summary: %s", exc)
 
-    def show_payment_qr(self, camera_ready: bool, total: float, qr_image: Image.Image):
-        """STAGE 6: Show UPI QR code for payment."""
+    def compose_payment_connecting_screen(self, camera_ready: bool, total: float) -> Image.Image:
+        img, draw = self._blank("#0b1320")
+        draw.text((20, 26), "CONNECTING", font=_load_font(16), fill=WHITE)
+        draw.text((20, 48), "TO PAYMENT...", font=_load_font(14), fill=CYAN)
+        draw.text((20, 76), f"Amount: ₹{total:.2f}", font=_load_font(12), fill=YELLOW)
+        draw.text((20, 96), "Please wait", font=_load_font(10, bold=False), fill=LT_GREY)
+        self._draw_camera_indicator(draw, camera_ready)
+        return img
+
+    def compose_payment_unavailable_screen(self, camera_ready: bool, detail: str | None = None) -> Image.Image:
+        img, draw = self._blank("#240a0a")
+        draw.text((14, 24), "PAYMENT", font=_load_font(16), fill=RED)
+        draw.text((14, 44), "UNAVAILABLE", font=_load_font(16), fill=RED)
+        draw.text((14, 72), "Use button skip", font=_load_font(11, bold=False), fill=WHITE)
+        draw.text((14, 86), "to test checkout", font=_load_font(11, bold=False), fill=WHITE)
+        if detail:
+            short = self._truncate(detail, _load_font(8, bold=False), TFT_WIDTH - 8)
+            draw.text((4, TFT_HEIGHT - 12), short, font=_load_font(8, bold=False), fill=LT_GREY)
+        self._draw_camera_indicator(draw, camera_ready)
+        return img
+
+    def compose_cart_empty_screen(self, camera_ready: bool) -> Image.Image:
+        img, draw = self._blank("#1f1212")
+        draw.text((24, 38), "CART IS", font=_load_font(18), fill=RED)
+        draw.text((24, 62), "EMPTY", font=_load_font(20), fill=WHITE)
+        draw.text((22, 92), "Scan items first", font=_load_font(10, bold=False), fill=LT_GREY)
+        self._draw_camera_indicator(draw, camera_ready)
+        return img
+
+    def compose_payment_timeout_screen(self, camera_ready: bool) -> Image.Image:
+        img, draw = self._blank("#220f0f")
+        draw.text((26, 36), "QR EXPIRED", font=_load_font(17), fill=RED)
+        draw.text((12, 70), "Press button to retry", font=_load_font(11, bold=False), fill=WHITE)
+        self._draw_camera_indicator(draw, camera_ready)
+        return img
+
+    def compose_payment_screen(
+        self,
+        camera_ready: bool,
+        total: float,
+        qr_image: Image.Image | None,
+        footer_text: str = "Btn=skip(test)",
+        footer_fill: str = GREY,
+        order_id: str | None = None,
+    ) -> Image.Image:
+        img, draw = self._blank("#101114")
+        title_font = _load_font(14)
+        amount_font = _load_font(16)
+        brand_font = _load_font(9, bold=False)
+        footer_font = _load_font(8, bold=False)
+
+        title = "SCAN TO PAY"
+        tw = self._text_width(title, title_font)
+        draw.text(((TFT_WIDTH - tw) // 2, 5), title, font=title_font, fill=WHITE)
+
+        if qr_image is not None:
+            qr_size = min(100, max(64, TFT_HEIGHT - 46))
+            qr_render = qr_image.convert("RGB").resize((qr_size, qr_size), Image.LANCZOS)
+            qr_x = (TFT_WIDTH - qr_size) // 2
+            qr_y = 22
+            img.paste(qr_render, (qr_x, qr_y))
+        else:
+            draw.rectangle([(20, 22), (TFT_WIDTH - 20, 92)], outline=GREY, width=1)
+            draw.text((34, 45), "QR IMAGE", font=_load_font(12), fill=LT_GREY)
+            draw.text((34, 61), "UNAVAILABLE", font=_load_font(12), fill=LT_GREY)
+            if order_id:
+                short = self._truncate(order_id, _load_font(8, bold=False), TFT_WIDTH - 16)
+                draw.text((8, 78), short, font=_load_font(8, bold=False), fill=CYAN)
+
+        amount = f"₹{total:.2f}"
+        aw = self._text_width(amount, amount_font)
+        draw.rectangle([(0, TFT_HEIGHT - 27), (TFT_WIDTH, TFT_HEIGHT)], fill="#151515")
+        draw.text(((TFT_WIDTH - aw) // 2, TFT_HEIGHT - 27), amount, font=amount_font, fill=YELLOW)
+
+        brand = "Powered by Razorpay"
+        bw = self._text_width(brand, brand_font)
+        draw.text(((TFT_WIDTH - bw) // 2, TFT_HEIGHT - 12), brand, font=brand_font, fill=LT_GREY)
+
+        if footer_text:
+            fw = self._text_width(footer_text, footer_font)
+            draw.text(((TFT_WIDTH - fw) // 2, TFT_HEIGHT - 22), footer_text, font=footer_font, fill=footer_fill)
+
+        self._draw_camera_indicator(draw, camera_ready)
+        return img
+
+    def compose_payment_success_screen(self, camera_ready: bool, total: float, payment_id: str) -> Image.Image:
+        img, draw = self._blank("#0d2b0d")
+        draw.text((10, 24), "✓ PAYMENT", font=_load_font(18), fill="#5dff86")
+        draw.text((10, 46), "RECEIVED", font=_load_font(18), fill="#5dff86")
+        draw.text((30, 72), f"₹{total:.2f}", font=_load_font(18), fill=WHITE)
+        draw.text((40, 94), "Thank you!", font=_load_font(14), fill=YELLOW)
+        suffix = payment_id[-8:] if payment_id else ""
+        if suffix:
+            draw.text((42, 112), suffix, font=_load_font(9, bold=False), fill=LT_GREY)
+        self._draw_camera_indicator(draw, camera_ready)
+        return img
+
+    def show_cart_empty(self, camera_ready: bool) -> None:
+        if not _DISPLAY_AVAILABLE or not self._device:
+            logger.info("[TFT] Cart is empty")
+            return
+        try:
+            self.render_screen(self.compose_cart_empty_screen(camera_ready), "cart_empty")
+        except Exception as exc:
+            logger.error("TFT show_cart_empty: %s", exc)
+
+    def show_payment_connecting(self, camera_ready: bool, total: float) -> None:
+        if not _DISPLAY_AVAILABLE or not self._device:
+            logger.info("[TFT] Connecting payment for ₹%.2f", total)
+            return
+        try:
+            self.render_screen(self.compose_payment_connecting_screen(camera_ready, total), "payment_connecting")
+        except Exception as exc:
+            logger.error("TFT show_payment_connecting: %s", exc)
+
+    def show_payment_unavailable(self, camera_ready: bool, detail: str | None = None) -> None:
+        if not _DISPLAY_AVAILABLE or not self._device:
+            logger.info("[TFT] Payment unavailable")
+            return
+        try:
+            self.render_screen(
+                self.compose_payment_unavailable_screen(camera_ready, detail),
+                "payment_unavailable",
+            )
+        except Exception as exc:
+            logger.error("TFT show_payment_unavailable: %s", exc)
+
+    def show_payment_timeout(self, camera_ready: bool) -> None:
+        if not _DISPLAY_AVAILABLE or not self._device:
+            logger.info("[TFT] Payment timeout")
+            return
+        try:
+            self.render_screen(self.compose_payment_timeout_screen(camera_ready), "payment_timeout")
+        except Exception as exc:
+            logger.error("TFT show_payment_timeout: %s", exc)
+
+    def show_processing_message(self, camera_ready: bool, title: str, subtitle: str | None = None) -> None:
+        if not _DISPLAY_AVAILABLE or not self._device:
+            logger.info("[TFT] %s", title)
+            return
+        try:
+            img, draw = self._blank("#111111")
+            draw.text((14, 40), title, font=_load_font(16), fill=WHITE)
+            if subtitle:
+                draw.text((14, 64), subtitle, font=_load_font(11, bold=False), fill=LT_GREY)
+            self._draw_camera_indicator(draw, camera_ready)
+            self.render_screen(img, "status_message")
+        except Exception as exc:
+            logger.error("TFT show_processing_message: %s", exc)
+
+    def show_payment_qr(
+        self,
+        camera_ready: bool,
+        total: float,
+        qr_image: Image.Image | None,
+        footer_text: str = "Btn=skip(test)",
+        footer_fill: str = GREY,
+        order_id: str | None = None,
+    ):
+        """STAGE 6: Show payment QR code and amount."""
         if not _DISPLAY_AVAILABLE or not self._device:
             logger.info("[TFT QR] total=₹%.2f", total)
             return
         try:
-            img, draw = self._blank()
-
-            # Camera indicator
-            self._draw_camera_indicator(draw, camera_ready)
-
-            # Header
-            draw.rectangle([(0, 0), (TFT_WIDTH, 20)], fill="#4a3a00")
-            draw.text((6, 3), "SCAN TO PAY", font=_load_font(13), fill=YELLOW)
-
-            # QR code (centered, 90x90)
-            qr_size = 90
-            qr_resized = qr_image.convert("RGB").resize((qr_size, qr_size), Image.NEAREST)
-            qr_x = (TFT_WIDTH - qr_size) // 2
-            img.paste(qr_resized, (qr_x, 22))
-
-            # Amount below QR
-            amount_str = f"₹{total:.2f}"
-            aw = self._text_width(amount_str, _load_font(14))
-            draw.text(((TFT_WIDTH - aw) // 2, TFT_HEIGHT - 14), amount_str,
-                     font=_load_font(14), fill=WHITE)
-
-            self._render(img)
+            img = self.compose_payment_screen(
+                camera_ready=camera_ready,
+                total=total,
+                qr_image=qr_image,
+                footer_text=footer_text,
+                footer_fill=footer_fill,
+                order_id=order_id,
+            )
+            self.render_screen(img, "payment_qr")
         except Exception as exc:
             logger.error("TFT show_payment_qr: %s", exc)
 
@@ -921,28 +1182,10 @@ class TFTDisplay:
             logger.info("[TFT ✓] Payment ₹%.2f receipt=%s", total, receipt_id)
             return
         try:
-            img, draw = self._blank()
-
-            # Camera indicator
-            self._draw_camera_indicator(draw, camera_ready)
-
-            # Header
-            draw.rectangle([(0, 0), (TFT_WIDTH, 20)], fill=DK_GREEN)
-            draw.text((6, 3), "PAYMENT SUCCESS", font=_load_font(12), fill=GREEN)
-
-            # Big checkmark
-            draw.text((10, 26), "✓", font=_load_font(40), fill=GREEN)
-            draw.text((70, 32), "PAID", font=_load_font(12), fill=WHITE)
-            draw.text((70, 50), f"₹{total:.2f}", font=_load_font(14), fill=WHITE)
-
-            draw.line([(0, 76), (TFT_WIDTH, 76)], fill=GREY, width=1)
-            draw.text((20, 82), "Thank you!", font=_load_font(16), fill=YELLOW)
-
-            # Receipt ID
-            short_id = self._truncate(receipt_id, _load_font(8, bold=False), TFT_WIDTH - 10)
-            draw.text((6, TFT_HEIGHT - 12), short_id, font=_load_font(8, bold=False), fill=GREY)
-
-            self._render(img)
+            self.render_screen(
+                self.compose_payment_success_screen(camera_ready, total, receipt_id),
+                "payment_success",
+            )
         except Exception as exc:
             logger.error("TFT show_payment_success: %s", exc)
 
@@ -1289,7 +1532,8 @@ class TerminalController:
 
     def start(self):
         logger.info("Terminal input thread started")
-        logger.info("Controls: type 'done' to checkout | 'clear' to reset cart")
+        logger.info("Terminal fallback: 'done'=checkout | 'skip'=skip payment")
+        logger.info("Extra controls: 'clear'=reset cart | 'quit'=stop runtime")
         self._running = True
         self._thread.start()
 
@@ -1317,7 +1561,7 @@ class TerminalController:
 
 
 class ScannerButtonController:
-    """GPIO button that forces scanner idle screen when pressed."""
+    """GPIO checkout button controller (active-low)."""
 
     def __init__(self, command_queue: queue.Queue, on_press=None):
         self._queue = command_queue
@@ -1325,16 +1569,16 @@ class ScannerButtonController:
         self._started = False
         self._running = False
         self._thread = threading.Thread(target=self._run, daemon=True)
-        self._debounce_seconds = max(0.05, SCANNER_BUTTON_BOUNCETIME_MS / 1000.0)
+        self._debounce_seconds = max(0.05, CHECKOUT_BUTTON_BOUNCETIME_MS / 1000.0)
         self._last_press_at = 0.0
-        self._actual_pin = SCANNER_BUTTON_PIN
+        self._actual_pin = CHECKOUT_BUTTON_PIN
 
     def start(self) -> None:
-        if not SCANNER_BUTTON_ENABLED:
-            logger.info("Scanner button disabled by SCANNER_BUTTON_ENABLED")
+        if not CHECKOUT_BUTTON_ENABLED:
+            logger.info("Checkout button disabled by CHECKOUT_BUTTON_ENABLED")
             return
         if GPIO is None:
-            logger.warning("RPi.GPIO unavailable; scanner button disabled")
+            logger.warning("RPi.GPIO unavailable; checkout button disabled")
             return
         try:
             current_mode = GPIO.getmode()
@@ -1345,26 +1589,26 @@ class ScannerButtonController:
 
             if current_mode == GPIO.BCM:
                 mode_label = "BCM"
-                if SCANNER_BUTTON_PIN_MODE == "board":
-                    mapped = BOARD_TO_BCM_PIN.get(SCANNER_BUTTON_PIN)
+                if CHECKOUT_BUTTON_PIN_MODE == "board":
+                    mapped = BOARD_TO_BCM_PIN.get(CHECKOUT_BUTTON_PIN)
                     if mapped is None:
                         raise ValueError(
-                            f"Unsupported board pin {SCANNER_BUTTON_PIN} for BCM mode mapping"
+                            f"Unsupported board pin {CHECKOUT_BUTTON_PIN} for BCM mode mapping"
                         )
                     self._actual_pin = mapped
                 else:
-                    self._actual_pin = SCANNER_BUTTON_PIN
+                    self._actual_pin = CHECKOUT_BUTTON_PIN
             elif current_mode == GPIO.BOARD:
                 mode_label = "BOARD"
-                if SCANNER_BUTTON_PIN_MODE == "bcm":
-                    mapped = BCM_TO_BOARD_PIN.get(SCANNER_BUTTON_PIN)
+                if CHECKOUT_BUTTON_PIN_MODE == "bcm":
+                    mapped = BCM_TO_BOARD_PIN.get(CHECKOUT_BUTTON_PIN)
                     if mapped is None:
                         raise ValueError(
-                            f"Unsupported BCM pin {SCANNER_BUTTON_PIN} for BOARD mode mapping"
+                            f"Unsupported BCM pin {CHECKOUT_BUTTON_PIN} for BOARD mode mapping"
                         )
                     self._actual_pin = mapped
                 else:
-                    self._actual_pin = SCANNER_BUTTON_PIN
+                    self._actual_pin = CHECKOUT_BUTTON_PIN
             else:
                 raise RuntimeError(f"Unsupported GPIO mode: {current_mode}")
 
@@ -1374,15 +1618,31 @@ class ScannerButtonController:
             self._thread.start()
             initial_level = GPIO.input(self._actual_pin)
             logger.info(
-                "Scanner button ready on %s pin %d (initial=%d)",
+                "Checkout button ready on %s pin %d (initial=%d)",
                 mode_label,
                 self._actual_pin,
                 initial_level,
             )
-            if SCANNER_BUTTON_PIN_MODE == "board" and SCANNER_BUTTON_PIN == 11:
+            if mode_label == "BCM":
+                board_pin = BCM_TO_BOARD_PIN.get(self._actual_pin)
+                if board_pin is not None:
+                    logger.info(
+                        "Checkout button mapping: BCM %d == physical pin %d (other side to GND)",
+                        self._actual_pin,
+                        board_pin,
+                    )
+            elif mode_label == "BOARD":
+                bcm_pin = BOARD_TO_BCM_PIN.get(self._actual_pin)
+                if bcm_pin is not None:
+                    logger.info(
+                        "Checkout button mapping: physical pin %d == BCM %d (other side to GND)",
+                        self._actual_pin,
+                        bcm_pin,
+                    )
+            if CHECKOUT_BUTTON_PIN_MODE == "board" and CHECKOUT_BUTTON_PIN == 11:
                 logger.info("Button wiring: physical pin 11 -> button -> physical pin 39 (GND)")
         except Exception as exc:
-            logger.warning("Scanner button init failed: %s", exc)
+            logger.warning("Checkout button init failed: %s", exc)
 
     def _run(self) -> None:
         if GPIO is None:
@@ -1405,7 +1665,7 @@ class ScannerButtonController:
                 if (now - self._last_press_at) >= self._debounce_seconds:
                     self._last_press_at = now
                     try:
-                        logger.info("Scanner button edge detected")
+                        logger.info("Checkout button edge detected")
                         if self._on_press is not None:
                             self._on_press()
                         else:
@@ -1450,6 +1710,7 @@ def main() -> int:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()
+        ensure_transaction_payment_columns()
         logger.info("DB connection successful")
     except Exception as exc:
         logger.error("DB connection failed: %s", exc)
@@ -1530,9 +1791,10 @@ def main() -> int:
         logger.info("Camera unavailable - using stdin fallback for barcode input")
     else:
         logger.info("Camera ready - scanning barcodes with camera")
-    logger.info("To checkout: press button once (or scan barcode 'done')")
-    logger.info("To mark payment done: press button again while QR is displayed")
+    logger.info("To checkout: press button once (or terminal fallback 'done')")
+    logger.info("To skip test payment: press button again on payment screen (or fallback 'skip')")
     logger.info("To clear cart: type/scan 'clear'")
+    logger.info("Terminal fallback: 'done'=checkout | 'skip'=skip payment")
     logger.info("=" * 50)
 
     running = True
@@ -1540,11 +1802,13 @@ def main() -> int:
     last_seen_at = 0.0
     checkout_triggered = False
     checkout_busy = False
-    payment_qr_active = False
-    payment_confirm_requested = False
     payment_context: dict | None = None
+    payment_poll_thread: threading.Thread | None = None
     blink_timer = time.time()
     tft_reinit_at = time.monotonic()
+
+    global app_state
+    app_state = STATE_IDLE
 
     def _handle_stop(_sig=None, _frame=None):
         nonlocal running
@@ -1555,54 +1819,17 @@ def main() -> int:
 
     def _log_cart_state() -> None:
         logger.debug(
-            "[CART STATE] %d items | Total qty: %d | Subtotal: ₹%.2f",
+            "[CART STATE] state=%s | %d items | Total qty: %d | Subtotal: ₹%.2f",
+            app_state,
             cart.unique_item_count,
             cart.total_quantity,
             cart.subtotal,
         )
 
-    def _process_pending_commands() -> None:
-        nonlocal running, checkout_triggered, payment_confirm_requested
-        while True:
-            try:
-                cmd = terminal_queue.get_nowait()
-            except queue.Empty:
-                break
-
-            if cmd in ("button", "scanner"):
-                if payment_qr_active:
-                    payment_confirm_requested = True
-                    logger.info("Button press: payment confirmation requested")
-                elif checkout_busy:
-                    logger.info("Button press ignored while checkout is preparing")
-                elif cart.unique_item_count > 0:
-                    checkout_triggered = True
-                    logger.info("[CHECKOUT] Triggered via physical button")
-                else:
-                    logger.info("Button press ignored: cart is empty")
-            elif isinstance(cmd, str) and cmd.startswith("terminal:"):
-                entered = cmd.split(":", 1)[1].strip().lower()
-                if entered == "done":
-                    logger.info("[TERMINAL] 'done' received -> triggering checkout")
-                    if cart.unique_item_count > 0:
-                        checkout_triggered = True
-                        logger.info("[CHECKOUT] Triggered via terminal input")
-                    else:
-                        logger.warning("[CHECKOUT] Terminal 'done' ignored: cart is empty")
-                elif entered == "clear":
-                    logger.info("[TERMINAL] 'clear' received -> resetting cart")
-                    cart.clear()
-                    camera_now = scanner.is_camera_ready()
-                    display.show_idle(camera_now, cart.unique_item_count, cart.total_quantity, cart.subtotal)
-                    logger.info("[SESSION] Cart cleared — returning to idle")
-                    _log_cart_state()
-                elif entered == "quit":
-                    logger.info("[TERMINAL] 'quit' received -> stopping runtime")
-                    running = False
-                else:
-                    logger.warning("[TERMINAL] Unknown command: '%s' — use 'done' or 'clear'", entered)
-            elif cmd == "quit":
-                running = False
+    def _set_idle_or_scanning_state() -> None:
+        global app_state
+        # Keep scanner-ready mode as the normal waiting state.
+        app_state = STATE_SCANNING
 
     def _sleep_with_button_handling(seconds: float) -> None:
         end_at = time.monotonic() + max(0.0, seconds)
@@ -1610,98 +1837,323 @@ def main() -> int:
             _process_pending_commands()
             time.sleep(0.05)
 
+    def _handle_payment_success(payment_details: dict) -> None:
+        nonlocal payment_context, checkout_busy, checkout_triggered
+        global app_state
+        if app_state != STATE_PAYMENT or not payment_context:
+            return
+
+        checkout_busy = True
+        payment_id = str(payment_details.get("id") or f"PAY_{uuid.uuid4().hex[:10]}")
+        final_total = float(payment_context["final_total"])
+        session_id = str(payment_context["session_id"])
+        order_id = str(payment_context.get("order_id") or "")
+        qr_id = str(payment_context.get("qr_id") or "")
+
+        try:
+            app_state = STATE_SUCCESS
+            tx_id = mark_transaction_paid(
+                session_id=session_id,
+                payment_id=payment_id,
+                razorpay_order_id=order_id,
+                razorpay_qr_id=qr_id,
+                items=cart.to_list(),
+                total=final_total,
+            )
+            logger.info("[PAYMENT] DB updated - status: paid | ref: %s | tx=%d", payment_id, tx_id)
+
+            camera_now = scanner.is_camera_ready()
+            display.show_payment_success(camera_now, final_total, payment_id)
+            _sleep_with_button_handling(2.0)
+
+            display.show_processing_message(camera_now, "Printing bill...")
+            logger.info("[PRINTER] Printing invoice...")
+            printer.print_receipt(session_id, cart, final_total, payment_id)
+
+            display.show_processing_message(camera_now, "Thank you!", "Come again")
+            _sleep_with_button_handling(3.0)
+
+            cart.clear()
+            payment_context = None
+            checkout_triggered = False
+            _set_idle_or_scanning_state()
+            camera_now = scanner.is_camera_ready()
+            display.show_idle(camera_now, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+            logger.info("[SESSION] Reset complete - returning to idle")
+            _log_cart_state()
+        except Exception as exc:
+            logger.exception("[PAYMENT] Success handling failed: %s", exc)
+        finally:
+            checkout_busy = False
+
+    def _handle_payment_timeout() -> None:
+        nonlocal payment_context, checkout_triggered
+        if app_state != STATE_PAYMENT or not payment_context:
+            return
+        logger.warning("[PAYMENT] Payment QR expired without payment")
+        camera_now = scanner.is_camera_ready()
+        display.show_payment_timeout(camera_now)
+        _sleep_with_button_handling(3.0)
+        payment_context = None
+        checkout_triggered = False
+        _set_idle_or_scanning_state()
+        if cart.unique_item_count > 0:
+            display.show_cart_summary(camera_now, cart)
+        else:
+            display.show_idle(camera_now, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+
+    def _handle_payment_poll_error(error_text: str) -> None:
+        if app_state != STATE_PAYMENT or not payment_context:
+            return
+        logger.error("[PAYMENT] Polling thread crashed: %s", error_text)
+        camera_now = scanner.is_camera_ready()
+        display.show_payment_qr(
+            camera_now,
+            float(payment_context["final_total"]),
+            payment_context.get("qr_image"),
+            footer_text="Payment check error - use skip",
+            footer_fill=RED,
+            order_id=payment_context.get("order_id"),
+        )
+
+    def _queue_payment_success(payment_details: dict) -> None:
+        try:
+            terminal_queue.put(("payment_success", payment_details))
+        except Exception:
+            pass
+
+    def _queue_payment_timeout() -> None:
+        try:
+            terminal_queue.put(("payment_timeout", None))
+        except Exception:
+            pass
+
+    def _queue_payment_error(exc: Exception) -> None:
+        try:
+            terminal_queue.put(("payment_poll_error", str(exc)))
+        except Exception:
+            pass
+
     def _start_checkout_flow() -> None:
-        nonlocal checkout_triggered, checkout_busy, payment_qr_active, payment_context
-        if checkout_busy or payment_qr_active:
+        nonlocal checkout_triggered, checkout_busy, payment_context, payment_poll_thread
+        global app_state
+        if checkout_busy:
+            return
+        if app_state not in (STATE_IDLE, STATE_SCANNING):
             return
         if cart.unique_item_count == 0:
             checkout_triggered = False
+            logger.warning("[CHECKOUT] Cart is empty - ignoring checkout trigger")
+            camera_now = scanner.is_camera_ready()
+            display.show_cart_empty(camera_now)
+            _sleep_with_button_handling(2.0)
+            _set_idle_or_scanning_state()
+            display.show_idle(camera_now, cart.unique_item_count, cart.total_quantity, cart.subtotal)
             return
 
         checkout_busy = True
         checkout_triggered = False
-        logger.info("Starting checkout for %d items", cart.unique_item_count)
+        subtotal = cart.subtotal
+        gst = subtotal * 0.18
+        final_total = subtotal + gst
+        session_id = f"SESSION_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         camera_now = scanner.is_camera_ready()
 
         try:
-            display.show_cart_summary(camera_now, cart)
-            _sleep_with_button_handling(1.5)
+            app_state = STATE_PAYMENT
+            logger.info("[PAYMENT] Connecting to Razorpay...")
+            display.show_payment_connecting(camera_now, final_total)
 
-            subtotal = cart.subtotal
-            gst = subtotal * 0.18
-            final_total = subtotal + gst
+            if not _PAYMENT_MODULE_AVAILABLE:
+                raise RuntimeError(f"payment module unavailable: {_PAYMENT_IMPORT_ERROR}")
 
-            logger.info("[CHECKOUT] ===== CART SUMMARY =====")
-            for item in cart.items.values():
-                logger.info("  %s x%d = ₹%.2f", item.name, item.quantity, item.line_total())
-            logger.info("  TOTAL: ₹%.2f", final_total)
-            logger.info("[CHECKOUT] =========================")
+            order_id = create_razorpay_order(final_total, session_id)
+            qr_id, qr_image_url = generate_payment_qr(order_id, final_total)
 
-            session_id = f"SESSION_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-            upi_string = f"upi://pay?pa={UPI_ID}&pn={SHOP_NAME}&am={final_total:.2f}&cu=INR&tn={session_id}"
+            try:
+                qr_image = download_qr_image(qr_image_url)
+            except Exception as exc:
+                qr_image = None
+                logger.error("[PAYMENT] QR image download failed: %s", exc)
 
-            qr = qrcode.QRCode(version=1, box_size=10, border=2)
-            qr.add_data(upi_string)
-            qr.make(fit=True)
-            qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-
-            display.show_payment_qr(camera_now, final_total, qr_img)
-            payment_qr_active = True
-            payment_context = {
-                "session_id": session_id,
-                "final_total": final_total,
-            }
-
-            logger.info("[PAYMENT] UPI QR generated | Amount: ₹%.2f | UPI: %s", final_total, UPI_ID)
-            logger.info("Press button again to confirm payment")
-        finally:
-            checkout_busy = False
-
-    def _complete_checkout_flow() -> None:
-        nonlocal payment_qr_active, payment_context, payment_confirm_requested, checkout_busy
-        if checkout_busy or not payment_qr_active or not payment_context:
-            payment_confirm_requested = False
-            return
-
-        checkout_busy = True
-        payment_confirm_requested = False
-
-        session_id = str(payment_context["session_id"])
-        final_total = float(payment_context["final_total"])
-        payment_ref = f"UPI_{uuid.uuid4().hex[:8]}"
-
-        try:
-            logger.info("[PAYMENT] Payment confirmed")
-            tx_id = save_transaction(
+            pending_tx_id = save_transaction(
                 session_id=session_id,
                 items=cart.to_list(),
                 total=final_total,
-                status="paid",
-                payment_method="UPI/QR",
-                upi_ref=payment_ref,
+                status="pending",
+                payment_method="Razorpay UPI",
+                upi_ref="",
+                razorpay_order_id=order_id,
+                razorpay_qr_id=qr_id,
             )
-            logger.info("Transaction saved: id=%d session=%s", tx_id, session_id)
+            logger.info("[PAYMENT] Pending transaction saved: tx=%d", pending_tx_id)
 
-            camera_now = scanner.is_camera_ready()
-            display.show_payment_success(camera_now, final_total, session_id)
-            printer.print_receipt(session_id, cart, final_total, payment_ref)
+            payment_context = {
+                "session_id": session_id,
+                "final_total": final_total,
+                "order_id": order_id,
+                "qr_id": qr_id,
+                "tx_id": pending_tx_id,
+                "qr_image": qr_image,
+            }
+
+            footer_text = "Btn=skip(test)"
+            footer_fill = LT_GREY
+            if qr_image is None:
+                footer_text = "QR image error - poll active"
+                footer_fill = RED
+
+            display.show_payment_qr(
+                camera_now,
+                final_total,
+                qr_image,
+                footer_text=footer_text,
+                footer_fill=footer_fill,
+                order_id=order_id,
+            )
+
+            payment_poll_thread = threading.Thread(
+                target=poll_payment_status,
+                args=(qr_id, _queue_payment_success, _queue_payment_timeout),
+                kwargs={"timeout": 600, "on_error": _queue_payment_error},
+                daemon=True,
+            )
+            payment_poll_thread.start()
+            logger.info("[PAYMENT] Polling thread started for QR: %s", qr_id)
+        except Exception as exc:
+            error_text = str(exc)
+            logger.error("[PAYMENT] Setup failed: %s", error_text)
+
+            # If merchant UPI QR is disabled, keep payment state active so operator
+            # can press button once more to run test skip flow.
+            if "UPI transactions are not enabled" in error_text:
+                test_qr_image = None
+                if _QRCODE_AVAILABLE:
+                    try:
+                        upi_string = (
+                            f"upi://pay?pa={UPI_ID}&pn={SHOP_NAME}&am={final_total:.2f}"
+                            f"&cu=INR&tn={session_id}"
+                        )
+                        qr = qrcode.QRCode(version=1, box_size=10, border=2)
+                        qr.add_data(upi_string)
+                        qr.make(fit=True)
+                        test_qr_image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+                        logger.warning("[PAYMENT] Test mode local UPI QR generated (non-verified)")
+                    except Exception as qr_exc:
+                        logger.error("[PAYMENT] Test mode QR generation failed: %s", qr_exc)
+
+                payment_context = {
+                    "session_id": session_id,
+                    "final_total": final_total,
+                    "order_id": "TEST_MODE",
+                    "qr_id": "TEST_MODE",
+                    "tx_id": None,
+                    "qr_image": test_qr_image,
+                }
+                app_state = STATE_PAYMENT
+                if test_qr_image is not None:
+                    display.show_payment_qr(
+                        camera_now,
+                        final_total,
+                        test_qr_image,
+                        footer_text="TEST MODE QR | Btn=skip",
+                        footer_fill=ORANGE,
+                        order_id="TEST_MODE",
+                    )
+                else:
+                    display.show_payment_unavailable(camera_now, "UPI unavailable | Press button to skip")
+                logger.warning("[PAYMENT] UPI unavailable - test mode active (QR shown if available)")
+                return
+
+            display.show_payment_unavailable(camera_now, error_text)
 
             _sleep_with_button_handling(2.0)
-
-            cart.clear()
-            payment_qr_active = False
             payment_context = None
-
+            _set_idle_or_scanning_state()
             display.show_idle(camera_now, cart.unique_item_count, cart.total_quantity, cart.subtotal)
-            logger.info("[SESSION] Cart cleared — returning to idle")
-            _log_cart_state()
-            logger.info("Checkout complete. Ready for next customer.")
         finally:
             checkout_busy = False
+
+    def trigger_checkout(source: str) -> None:
+        nonlocal checkout_triggered
+        if app_state not in (STATE_IDLE, STATE_SCANNING):
+            logger.info("[CHECKOUT] Ignored in state: %s", app_state)
+            return
+        if source == "physical_button":
+            logger.info("[CHECKOUT] Triggered via physical button")
+        else:
+            logger.info("[CHECKOUT] Triggered via terminal fallback")
+        checkout_triggered = True
+
+    def trigger_skip_payment(source: str) -> None:
+        if app_state != STATE_PAYMENT or not payment_context:
+            logger.info("[PAYMENT] Skip ignored in state: %s", app_state)
+            return
+        session_id = str(payment_context["session_id"])
+        total = float(payment_context["final_total"])
+        if source == "physical_button":
+            logger.warning("[PAYMENT] TESTING MODE - Payment skipped via button")
+        else:
+            logger.warning("[PAYMENT] TESTING MODE - Payment skipped via terminal fallback")
+        _handle_payment_success(
+            {
+                "id": f"TEST_SKIP_{session_id}",
+                "amount": int(round(total * 100)),
+                "status": "captured",
+            }
+        )
+
+    def _process_pending_commands() -> None:
+        nonlocal running
+        while True:
+            try:
+                cmd = terminal_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if isinstance(cmd, tuple) and len(cmd) == 2:
+                event_name, payload = cmd
+                if event_name == "payment_success":
+                    _handle_payment_success(payload if isinstance(payload, dict) else {})
+                elif event_name == "payment_timeout":
+                    _handle_payment_timeout()
+                elif event_name == "payment_poll_error":
+                    _handle_payment_poll_error(str(payload))
+                continue
+
+            if cmd in ("button", "scanner"):
+                if app_state in (STATE_IDLE, STATE_SCANNING):
+                    trigger_checkout("physical_button")
+                elif app_state == STATE_PAYMENT:
+                    trigger_skip_payment("physical_button")
+                else:
+                    logger.debug("Button press ignored in state: %s", app_state)
+            elif isinstance(cmd, str) and cmd.startswith("terminal:"):
+                entered = cmd.split(":", 1)[1].strip().lower()
+                if entered == "done":
+                    trigger_checkout("terminal_fallback")
+                elif entered == "skip":
+                    trigger_skip_payment("terminal_fallback")
+                elif entered == "clear":
+                    logger.info("[TERMINAL] 'clear' received -> resetting cart")
+                    cart.clear()
+                    camera_now = scanner.is_camera_ready()
+                    display.show_idle(camera_now, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                    _set_idle_or_scanning_state()
+                    logger.info("[SESSION] Cart cleared — returning to idle")
+                    _log_cart_state()
+                elif entered == "quit":
+                    logger.info("[TERMINAL] 'quit' received -> stopping runtime")
+                    running = False
+                else:
+                    logger.warning("[TERMINAL] Unknown command: '%s' — use 'done', 'skip', 'clear', or 'quit'", entered)
+            elif cmd == "quit":
+                running = False
 
     # Show initial idle screen
     camera_ready = scanner.is_camera_ready()
     display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+    _set_idle_or_scanning_state()
     logger.info("Scan loop started — waiting for barcode...")
 
     # Main event loop
@@ -1710,13 +2162,10 @@ def main() -> int:
             try:
                 _process_pending_commands()
 
-                if checkout_triggered and not payment_qr_active and not checkout_busy:
+                if checkout_triggered and app_state in (STATE_IDLE, STATE_SCANNING) and not checkout_busy:
                     _start_checkout_flow()
 
-                if payment_confirm_requested and payment_qr_active and not checkout_busy:
-                    _complete_checkout_flow()
-
-                if payment_qr_active:
+                if app_state in (STATE_PAYMENT, STATE_SUCCESS):
                     time.sleep(0.05)
                     continue
 
@@ -1756,7 +2205,7 @@ def main() -> int:
                 logger.info("Barcode detected: %s (type: %s)", barcode, scanner.last_barcode_type())
 
             # Handle special commands (when using stdin fallback)
-                if barcode.lower() in ("quit", "done", "clear"):
+                if barcode.lower() in ("quit", "done", "skip", "clear"):
                     if barcode.lower() == "quit":
                         logger.info("Quit command received")
                         running = False
@@ -1765,15 +2214,13 @@ def main() -> int:
                         logger.info("[TERMINAL] 'clear' received -> resetting cart")
                         cart.clear()
                         display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                        _set_idle_or_scanning_state()
                         logger.info("[SESSION] Cart cleared — returning to idle")
                         _log_cart_state()
                     elif barcode.lower() == "done":
-                        logger.info("[TERMINAL] 'done' received -> triggering checkout")
-                        if cart.unique_item_count == 0:
-                            logger.warning("[CHECKOUT] Terminal 'done' ignored: cart is empty")
-                        else:
-                            logger.info("[CHECKOUT] Triggered via terminal input")
-                            checkout_triggered = True
+                        trigger_checkout("terminal_fallback")
+                    elif barcode.lower() == "skip":
+                        trigger_skip_payment("terminal_fallback")
                     continue
 
             # Handle special barcodes
@@ -1791,6 +2238,7 @@ def main() -> int:
                     else:
                         logger.info("No item to decrement")
                     display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                    _set_idle_or_scanning_state()
                     _log_cart_state()
                     continue
 
@@ -1804,6 +2252,7 @@ def main() -> int:
                     else:
                         logger.info("No item to remove")
                     display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                    _set_idle_or_scanning_state()
                     _log_cart_state()
                     continue
 
@@ -1881,6 +2330,7 @@ def main() -> int:
                     _sleep_with_button_handling(2.5)
 
                 display.show_idle(camera_ready, cart.unique_item_count, cart.total_quantity, cart.subtotal)
+                _set_idle_or_scanning_state()
                 _log_cart_state()
 
             except KeyboardInterrupt:
