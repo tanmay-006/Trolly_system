@@ -176,6 +176,14 @@ source .venv/bin/activate
 python main.py
 ```
 
+### 6b. Run both services with one command
+
+```bash
+bash run_all_safe.sh
+```
+
+This starts `pos_app.py` and `main.py` together and stops both if either one exits.
+
 Notes:
 - Requires `DATABASE_URL` in `.env`.
 - Uses camera barcode scanning when `picamera2` + `pyzbar` are available.
