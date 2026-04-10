@@ -11,32 +11,25 @@ if [[ ! -x "$PYTHON" ]]; then
 fi
 
 cleanup() {
-  local pids
-  pids="${POS_APP_PID:-} ${MAIN_PID:-}"
-  for pid in $pids; do
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-    fi
-  done
-  wait "${POS_APP_PID:-}" 2>/dev/null || true
+  local pid
+  pid="${MAIN_PID:-}"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+  fi
   wait "${MAIN_PID:-}" 2>/dev/null || true
 }
 
 trap cleanup EXIT INT TERM
 
-echo "Starting Smart Trolley services..."
-
-"$PYTHON" /home/trolley/Trolly_system/pos_app.py &
-POS_APP_PID=$!
+echo "Starting Smart Trolley runtime..."
 
 "$PYTHON" /home/trolley/Trolly_system/main.py &
 MAIN_PID=$!
 
-echo "pos_app.py PID: $POS_APP_PID"
 echo "main.py PID: $MAIN_PID"
-echo "Press Ctrl+C to stop both services."
+echo "Press Ctrl+C to stop runtime."
 
-wait -n "$POS_APP_PID" "$MAIN_PID"
+wait "$MAIN_PID"
 STATUS=$?
 
 cleanup
