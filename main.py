@@ -176,6 +176,8 @@ CHECKOUT_BUTTON_PIN = int(os.getenv("CHECKOUT_BUTTON_PIN", str(SCANNER_BUTTON_PI
 CHECKOUT_BUTTON_BOUNCETIME_MS = int(
     os.getenv("CHECKOUT_BUTTON_BOUNCETIME_MS", str(SCANNER_BUTTON_BOUNCETIME_MS))
 )
+BUTTON_LONG_PRESS_SECONDS = float(os.getenv("BUTTON_LONG_PRESS_SECONDS", "5.0"))
+PAYMENT_CONNECT_TIMEOUT_SECONDS = float(os.getenv("PAYMENT_CONNECT_TIMEOUT_SECONDS", "20.0"))
 
 STATE_IDLE = "idle"
 STATE_SCANNING = "scanning"
@@ -1723,7 +1725,10 @@ class ScannerButtonController:
         self._running = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._debounce_seconds = max(0.05, CHECKOUT_BUTTON_BOUNCETIME_MS / 1000.0)
+        self._long_press_seconds = max(1.0, BUTTON_LONG_PRESS_SECONDS)
         self._last_press_at = 0.0
+        self._press_started_at = 0.0
+        self._long_press_fired = False
         self._actual_pin = CHECKOUT_BUTTON_PIN
 
     def start(self) -> None:
@@ -1812,19 +1817,39 @@ class ScannerButtonController:
                 time.sleep(0.05)
                 continue
 
-            # Active-low button: transition HIGH->LOW means pressed.
+            now = time.monotonic()
+
+            # Active-low button: HIGH->LOW means press started.
             if prev == 1 and cur == 0:
-                now = time.monotonic()
-                if (now - self._last_press_at) >= self._debounce_seconds:
+                self._press_started_at = now
+                self._long_press_fired = False
+
+            # While held low, fire long-press once.
+            if cur == 0 and self._press_started_at > 0 and not self._long_press_fired:
+                if (now - self._press_started_at) >= self._long_press_seconds:
+                    self._long_press_fired = True
                     self._last_press_at = now
                     try:
-                        logger.info("Checkout button edge detected")
-                        if self._on_press is not None:
-                            self._on_press()
-                        else:
-                            self._queue.put_nowait("button")
+                        logger.warning("Checkout button long-press detected (%.1fs)", self._long_press_seconds)
+                        self._queue.put_nowait("button_long")
                     except Exception:
                         pass
+
+            # LOW->HIGH means released; treat as normal short press if long-press not fired.
+            if prev == 0 and cur == 1:
+                press_started_at = self._press_started_at
+                self._press_started_at = 0.0
+                if not self._long_press_fired and press_started_at > 0:
+                    if (now - self._last_press_at) >= self._debounce_seconds:
+                        self._last_press_at = now
+                        try:
+                            logger.info("Checkout button short-press detected")
+                            if self._on_press is not None:
+                                self._on_press()
+                            else:
+                                self._queue.put_nowait("button")
+                        except Exception:
+                            pass
             prev = cur
             time.sleep(0.02)
 
@@ -1957,6 +1982,8 @@ def main() -> int:
     checkout_busy = False
     payment_context: dict | None = None
     payment_poll_thread: threading.Thread | None = None
+    checkout_setup_thread: threading.Thread | None = None
+    payment_flow_token = ""
     blink_timer = time.time()
     tft_reinit_at = time.monotonic()
 
@@ -2100,8 +2127,27 @@ def main() -> int:
         except Exception:
             pass
 
+    def _run_with_timeout(func, timeout_seconds: float, *args):
+        """Run blocking payment SDK call with timeout to avoid indefinite 'connecting' state."""
+        box = {"value": None, "error": None}
+
+        def _worker():
+            try:
+                box["value"] = func(*args)
+            except Exception as exc:
+                box["error"] = exc
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        worker.join(max(0.1, timeout_seconds))
+        if worker.is_alive():
+            raise TimeoutError(f"{func.__name__} timed out after {timeout_seconds:.1f}s")
+        if box["error"] is not None:
+            raise box["error"]
+        return box["value"]
+
     def _start_checkout_flow() -> None:
-        nonlocal checkout_triggered, checkout_busy, payment_context, payment_poll_thread
+        nonlocal checkout_triggered, checkout_busy, payment_context, payment_poll_thread, payment_flow_token
         global app_state
         if checkout_busy:
             return
@@ -2123,6 +2169,8 @@ def main() -> int:
         gst = subtotal * 0.18
         final_total = subtotal + gst
         session_id = f"SESSION_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        flow_token = uuid.uuid4().hex
+        payment_flow_token = flow_token
         camera_now = scanner.is_camera_ready()
 
         try:
@@ -2133,8 +2181,25 @@ def main() -> int:
             if not _PAYMENT_MODULE_AVAILABLE:
                 raise RuntimeError(f"payment module unavailable: {_PAYMENT_IMPORT_ERROR}")
 
-            order_id = create_razorpay_order(final_total, session_id)
-            qr_id, qr_image_url = generate_payment_qr(order_id, final_total)
+            order_id = _run_with_timeout(
+                create_razorpay_order,
+                PAYMENT_CONNECT_TIMEOUT_SECONDS,
+                final_total,
+                session_id,
+            )
+            if flow_token != payment_flow_token:
+                logger.info("[PAYMENT] Stale checkout flow ignored after order creation")
+                return
+
+            qr_id, qr_image_url = _run_with_timeout(
+                generate_payment_qr,
+                PAYMENT_CONNECT_TIMEOUT_SECONDS,
+                order_id,
+                final_total,
+            )
+            if flow_token != payment_flow_token:
+                logger.info("[PAYMENT] Stale checkout flow ignored after QR generation")
+                return
 
             try:
                 qr_image = download_qr_image(qr_image_url)
@@ -2251,6 +2316,21 @@ def main() -> int:
             logger.info("[CHECKOUT] Triggered via terminal fallback")
         checkout_triggered = True
 
+    def trigger_payment_refresh(source: str) -> None:
+        nonlocal checkout_triggered, payment_context, payment_flow_token
+        global app_state
+        if app_state != STATE_PAYMENT:
+            logger.info("[PAYMENT] Refresh ignored in state: %s", app_state)
+            return
+
+        logger.warning("[PAYMENT] Refresh requested via %s", source)
+        payment_flow_token = uuid.uuid4().hex  # invalidate in-flight setup flow
+        payment_context = None
+        checkout_triggered = True
+        _set_idle_or_scanning_state()
+        camera_now = scanner.is_camera_ready()
+        display.show_processing_message(camera_now, "Refreshing payment...", "Please wait")
+
     def trigger_skip_payment(source: str) -> None:
         if app_state != STATE_PAYMENT or not payment_context:
             logger.info("[PAYMENT] Skip ignored in state: %s", app_state)
@@ -2296,6 +2376,8 @@ def main() -> int:
                     trigger_skip_payment("physical_button")
                 else:
                     logger.debug("Button press ignored in state: %s", app_state)
+            elif cmd == "button_long":
+                trigger_payment_refresh("long_press")
             elif isinstance(cmd, str) and cmd.startswith("terminal:"):
                 entered = cmd.split(":", 1)[1].strip().lower()
                 if entered == "done":
@@ -2331,7 +2413,9 @@ def main() -> int:
                 _process_pending_commands()
 
                 if checkout_triggered and app_state in (STATE_IDLE, STATE_SCANNING) and not checkout_busy:
-                    _start_checkout_flow()
+                    if checkout_setup_thread is None or not checkout_setup_thread.is_alive():
+                        checkout_setup_thread = threading.Thread(target=_start_checkout_flow, daemon=True)
+                        checkout_setup_thread.start()
 
                 if app_state in (STATE_PAYMENT, STATE_SUCCESS):
                     time.sleep(0.05)
