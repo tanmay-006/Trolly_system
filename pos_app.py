@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 # ── Environment ──────────────────────────────────────────────────────────────
 load_dotenv()
 
-DATABASE_URL = os.environ["DATABASE_URL"]
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD", "5"))
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
@@ -35,6 +35,8 @@ _INDEXES_READY = False
 @contextmanager
 def get_db():
     """Short-lived psycopg2 connection. Always closes after the with block."""
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured")
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         yield conn
