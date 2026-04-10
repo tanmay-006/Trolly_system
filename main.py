@@ -1371,41 +1371,64 @@ class ReceiptPrinter:
             return ImageFont.load_default()
 
     def _build_receipt_image(self, session_id: str, cart: SessionCart, total: float, payment_ref: str) -> Image.Image:
-        """Build invoice as grayscale image in N4 format."""
+        """Build invoice as grayscale image in N4 format with proper GST breakdown."""
         line_w = 32
         items = cart.items.values()
         sid = str(session_id or "-")
         pid = str(payment_ref or "-")
-        ts = datetime.now().strftime("%d/%m/%Y  %H:%M:%S")
+        ts = datetime.now().strftime("%d/%m/%Y %H:%M")
 
+        subtotal = float(cart.subtotal)
+        gst_amount = subtotal * 0.18
+        
         lines = [
-            "SMART TROLLEY".center(line_w),
-            "N4 IMAGE MODE".center(line_w),
+            "SMART TROLLEY SHOP".center(line_w),
             "=" * line_w,
-            f"Date/Time : {ts}"[:line_w],
-            f"Bill No   : {sid[-8:]}"[:line_w],
-            f"Pay Ref   : {pid[-12:]}"[:line_w],
-            "-" * line_w,
-            f"{'Item':<16}{'Qty':>4}  {'Amt':>8}"[:line_w],
-            "-" * line_w,
+            "",
         ]
 
+        # Receipt header
+        date_line = f"Date/Time : {ts}"
+        lines.append(date_line if len(date_line) <= line_w else date_line[:line_w])
+        
+        bill_line = f"Bill No : {sid[-8:]}"
+        lines.append(bill_line if len(bill_line) <= line_w else bill_line[:line_w])
+        
+        pay_line = f"Pay Ref : {pid[-10:]}"
+        lines.append(pay_line if len(pay_line) <= line_w else pay_line[:line_w])
+        
+        lines.append("")
+        lines.append("-" * line_w)
+        lines.append("Item            Qty  Price")
+        lines.append("-" * line_w)
+
+        # Items with details
         for item in items:
-            name = str(item.name)[:16]
+            name = str(item.name)[:13]
             qty = int(item.quantity)
             unit = float(item.price)
             amt = float(item.line_total())
-            lines.append(f"{name:<16}{qty:>4}  {amt:>7.2f}"[:line_w])
-            lines.append(f"  @ Rs{unit:.2f} each"[:line_w])
+            
+            # Item row: name, qty, unit price
+            item_line = f"{name:<13} {qty:>3}  {unit:>6.2f}"
+            lines.append(item_line[:line_w] if len(item_line) > line_w else item_line)
+            
+            # Amount line
+            amt_line = f"  Amt: Rs {amt:>8.2f}"
+            lines.append(amt_line if len(amt_line) <= line_w else amt_line[:line_w])
+            lines.append("")
 
-        count = sum(int(item.quantity) for item in items)
+        # Summary section
         lines.extend([
             "=" * line_w,
-            f"Items     : {count}"[:line_w],
+            f"Subtotal  Rs {subtotal:>10.2f}",
+            f"GST 18%   Rs {gst_amount:>10.2f}",
             "-" * line_w,
-            f"TOTAL: Rs{total:.2f}".rjust(line_w)[:line_w],
+            f"TOTAL     Rs {total:>10.2f}",
             "=" * line_w,
-            "Thank you for shopping!".center(line_w),
+            "",
+            "Thank you!".center(line_w),
+            "Visit again soon!".center(line_w),
             "",
             "",
         ])
