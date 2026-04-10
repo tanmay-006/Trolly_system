@@ -136,6 +136,8 @@ BLUETOOTH_PRINTER_MAC = os.getenv("BLUETOOTH_PRINTER_MAC", "").strip()
 BT_PRINTER_CHANNEL = int(os.getenv("BT_PRINTER_CHANNEL", "1"))
 BT_PRINTER_ROW_DELAY_SECONDS = float(os.getenv("BT_PRINTER_ROW_DELAY_SECONDS", "0.005"))
 BT_PRINTER_WIDTH = int(os.getenv("BT_PRINTER_WIDTH", "384"))
+PAYMENT_SUCCESS_HOLD_SECONDS = float(os.getenv("PAYMENT_SUCCESS_HOLD_SECONDS", "0.8"))
+PAYMENT_THANK_YOU_SECONDS = float(os.getenv("PAYMENT_THANK_YOU_SECONDS", "1.2"))
 LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD", "5"))
 
 HX711_DOUT_PIN = int(os.getenv("HX711_DOUT_PIN", "5"))
@@ -2003,6 +2005,9 @@ def main() -> int:
 
         try:
             app_state = STATE_SUCCESS
+            camera_now = scanner.is_camera_ready()
+            display.show_processing_message(camera_now, "Payment received", "Finalizing order...")
+
             tx_id = mark_transaction_paid(
                 session_id=session_id,
                 payment_id=payment_id,
@@ -2025,14 +2030,14 @@ def main() -> int:
 
             camera_now = scanner.is_camera_ready()
             display.show_payment_success(camera_now, final_total, payment_id)
-            _sleep_with_button_handling(2.0)
+            _sleep_with_button_handling(PAYMENT_SUCCESS_HOLD_SECONDS)
 
             display.show_processing_message(camera_now, "Printing bill...")
             logger.info("[PRINTER] Printing invoice...")
             printer.print_receipt(session_id, cart, final_total, payment_id)
 
             display.show_processing_message(camera_now, "Thank you!", "Come again")
-            _sleep_with_button_handling(3.0)
+            _sleep_with_button_handling(PAYMENT_THANK_YOU_SECONDS)
 
             cart.clear()
             payment_context = None
@@ -2252,11 +2257,13 @@ def main() -> int:
             return
         session_id = str(payment_context["session_id"])
         total = float(payment_context["final_total"])
+        camera_now = scanner.is_camera_ready()
+        display.show_processing_message(camera_now, "Skip accepted", "Processing test success...")
         if source == "physical_button":
             logger.warning("[PAYMENT] TESTING MODE - Payment skipped via button")
         else:
             logger.warning("[PAYMENT] TESTING MODE - Payment skipped via terminal fallback")
-        _handle_payment_success(
+        _queue_payment_success(
             {
                 "id": f"TEST_SKIP_{session_id}",
                 "amount": int(round(total * 100)),
