@@ -1297,6 +1297,26 @@ class ReceiptPrinter:
         "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
     ]
 
+    # CRC8 lookup table for N4 printer protocol (proven working format)
+    _CRC8_TABLE = [
+        0x00,0x07,0x0e,0x09,0x1c,0x1b,0x12,0x15,0x38,0x3f,0x36,0x31,0x24,0x23,0x2a,0x2d,
+        0x70,0x77,0x7e,0x79,0x6c,0x6b,0x62,0x65,0x48,0x4f,0x46,0x41,0x54,0x53,0x5a,0x5d,
+        0xe0,0xe7,0xee,0xe9,0xfc,0xfb,0xf2,0xf5,0xd8,0xdf,0xd6,0xd1,0xc4,0xc3,0xca,0xcd,
+        0x90,0x97,0x9e,0x99,0x8c,0x8b,0x82,0x85,0xa8,0xaf,0xa6,0xa1,0xb4,0xb3,0xba,0xbd,
+        0xc7,0xc0,0xc9,0xce,0xdb,0xdc,0xd5,0xd2,0xff,0xf8,0xf1,0xf6,0xe3,0xe4,0xed,0xea,
+        0xb7,0xb0,0xb9,0xbe,0xab,0xac,0xa5,0xa2,0x8f,0x88,0x81,0x86,0x93,0x94,0x9d,0x9a,
+        0x27,0x20,0x29,0x2e,0x3b,0x3c,0x35,0x32,0x1f,0x18,0x11,0x16,0x03,0x04,0x0d,0x0a,
+        0x57,0x50,0x59,0x5e,0x4b,0x4c,0x45,0x42,0x6f,0x68,0x61,0x66,0x73,0x74,0x7d,0x7a,
+        0x89,0x8e,0x87,0x80,0x95,0x92,0x9b,0x9c,0xb1,0xb6,0xbf,0xb8,0xad,0xaa,0xa3,0xa4,
+        0xf9,0xfe,0xf7,0xf0,0xe5,0xe2,0xeb,0xec,0xc1,0xc6,0xcf,0xc8,0xdd,0xda,0xd3,0xd4,
+        0x69,0x6e,0x67,0x60,0x75,0x72,0x7b,0x7c,0x51,0x56,0x5f,0x58,0x4d,0x4a,0x43,0x44,
+        0x19,0x1e,0x17,0x10,0x05,0x02,0x0b,0x0c,0x21,0x26,0x2f,0x28,0x3d,0x3a,0x33,0x34,
+        0x4e,0x49,0x40,0x47,0x52,0x55,0x5c,0x5b,0x76,0x71,0x78,0x7f,0x6a,0x6d,0x64,0x63,
+        0x3e,0x39,0x30,0x37,0x22,0x25,0x2c,0x2b,0x06,0x01,0x08,0x0f,0x1a,0x1d,0x14,0x13,
+        0xae,0xa9,0xa0,0xa7,0xb2,0xb5,0xbc,0xbb,0x96,0x91,0x98,0x9f,0x8a,0x8d,0x84,0x83,
+        0xde,0xd9,0xd0,0xd7,0xc2,0xc5,0xcc,0xcb,0xe6,0xe1,0xe8,0xef,0xfa,0xfd,0xf4,0xf3,
+    ]
+
     def __init__(self, mac_address: str):
         self._printer = None
         self._mode = None
@@ -1317,30 +1337,28 @@ class ReceiptPrinter:
 
         if hasattr(socket, "AF_BLUETOOTH") and Image is not None and ImageDraw is not None and ImageFont is not None:
             self._mode = "raw_bt"
-            logger.info("Bluetooth printer initialized via raw RFCOMM image mode: %s", mac_address)
+            logger.info("Bluetooth printer initialized via raw RFCOMM image mode (N4 format): %s", mac_address)
             return
 
         logger.warning("No compatible Bluetooth printer backend available; receipt printing disabled")
 
     @staticmethod
-    def _crc8(data: list[int]) -> int:
+    def _crc8(data: bytes) -> int:
+        """Calculate CRC8 checksum using lookup table (N4 printer protocol)."""
         crc = 0
         for byte in data:
-            crc ^= (byte & 0xFF)
-            for _ in range(8):
-                if crc & 0x80:
-                    crc = ((crc << 1) ^ 0x07) & 0xFF
-                else:
-                    crc = (crc << 1) & 0xFF
+            crc = ReceiptPrinter._CRC8_TABLE[(crc ^ byte) & 0xFF]
         return crc & 0xFF
 
     @classmethod
     def _make_packet(cls, cmd: int, data: list[int]) -> bytes:
-        payload = [int(v) & 0xFF for v in data]
-        return bytes([0x51, 0x78, cmd & 0xFF, 0x00, len(payload), 0x00] + payload + [cls._crc8(payload), 0xFF])
+        """Build packet with N4 protocol structure: header + command + payload + CRC + terminator."""
+        payload = bytes(int(v) & 0xFF for v in data)
+        return bytes([0x51, 0x78, cmd & 0xFF, 0x00, len(payload), 0x00]) + payload + bytes([cls._crc8(payload), 0xFF])
 
     @classmethod
     def _load_printer_font(cls, size: int):
+        """Load a TrueType font or fall back to default."""
         for path in cls._PRINTER_FONT_CANDIDATES:
             if os.path.exists(path):
                 try:
@@ -1352,85 +1370,96 @@ class ReceiptPrinter:
         except TypeError:
             return ImageFont.load_default()
 
-    def _build_receipt_image(self, session_id: str, cart: SessionCart, total: float, payment_ref: str):
+    def _build_receipt_image(self, session_id: str, cart: SessionCart, total: float, payment_ref: str) -> Image.Image:
+        """Build invoice as grayscale image in N4 format."""
+        line_w = 32
+        items = cart.items.values()
+        sid = str(session_id or "-")
+        pid = str(payment_ref or "-")
+        ts = datetime.now().strftime("%d/%m/%Y  %H:%M:%S")
+
         lines = [
-            SHOP_NAME,
-            "=" * 32,
-            f"Receipt: {session_id}",
-            f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            "=" * 32,
-            "",
+            "SMART TROLLEY".center(line_w),
+            "N4 IMAGE MODE".center(line_w),
+            "=" * line_w,
+            f"Date/Time : {ts}"[:line_w],
+            f"Bill No   : {sid[-8:]}"[:line_w],
+            f"Pay Ref   : {pid[-12:]}"[:line_w],
+            "-" * line_w,
+            f"{'Item':<16}{'Qty':>4}  {'Amt':>8}"[:line_w],
+            "-" * line_w,
         ]
 
-        for item in cart.items.values():
-            lines.append(f"{item.name[:20]} x{item.quantity}")
-            lines.append(f"  INR {item.price:.2f} = INR {item.line_total():.2f}")
+        for item in items:
+            name = str(item.name)[:16]
+            qty = int(item.quantity)
+            unit = float(item.price)
+            amt = float(item.line_total())
+            lines.append(f"{name:<16}{qty:>4}  {amt:>7.2f}"[:line_w])
+            lines.append(f"  @ Rs{unit:.2f} each"[:line_w])
 
-        tax = cart.subtotal * 0.18
-        lines.extend(
-            [
-                "",
-                "-" * 32,
-                f"Subtotal: INR {cart.subtotal:.2f}",
-                f"GST @18%: INR {tax:.2f}",
-                f"TOTAL: INR {total:.2f}",
-                "=" * 32,
-                f"Payment: {payment_ref}",
-                "",
-                "Thank you for shopping!",
-                "",
-            ]
-        )
+        count = sum(int(item.quantity) for item in items)
+        lines.extend([
+            "=" * line_w,
+            f"Items     : {count}"[:line_w],
+            "-" * line_w,
+            f"TOTAL: Rs{total:.2f}".rjust(line_w)[:line_w],
+            "=" * line_w,
+            "Thank you for shopping!".center(line_w),
+            "",
+            "",
+        ])
 
-        width = max(128, BT_PRINTER_WIDTH)
-        margin_x = 8
-        top_margin = 8
-        bottom_margin = 12
-        line_gap = 6
+        # Build image with calculated dimensions
+        line_h = 28
+        top = 10
+        img_h = max(180, top * 2 + len(lines) * line_h)
+
+        img = Image.new("L", (BT_PRINTER_WIDTH, img_h), 255)
+        draw = ImageDraw.Draw(img)
         font = self._load_printer_font(24)
 
-        line_height = (font.getbbox("Hg")[3] - font.getbbox("Hg")[1]) + line_gap
-        height = top_margin + (len(lines) * line_height) + bottom_margin
-
-        image = Image.new("L", (width, height), 255)
-        draw = ImageDraw.Draw(image)
-
-        y = top_margin
+        y = top
         for line in lines:
-            draw.text((margin_x, y), line, fill=0, font=font)
-            y += line_height
+            draw.text((6, y), line, fill=0, font=font)
+            y += line_h
 
-        return image.point(lambda x: 0 if x < 128 else 255).convert("1")
+        return img
 
-    def _send_image_raw_bluetooth(self, image) -> None:
-        image_l = image.convert("L")
+    def _send_image_raw_bluetooth(self, image: Image.Image) -> None:
+        """Send image to printer via Bluetooth using N4 protocol (LSB bit order)."""
+        img_l = image.convert("L")
         packets: list[bytes] = []
 
-        for y in range(image_l.height):
+        # Convert image rows to printer packets using LSB bit order (proven format)
+        for y in range(img_l.height):
             row_bytes: list[int] = []
             for x in range(0, BT_PRINTER_WIDTH, 8):
-                value = 0
+                byte = 0
                 for bit in range(8):
-                    xx = x + bit
-                    px = 255
-                    if xx < image_l.width:
-                        px = image_l.getpixel((xx, y))
+                    px = img_l.getpixel((x + bit, y)) if x + bit < img_l.width else 255
+                    # Threshold at 128: pixel < 128 = black (bit set)
                     if px < 128:
-                        value |= (1 << (7 - bit))
-                row_bytes.append(value)
+                        byte |= 1 << bit  # LSB bit order
+                row_bytes.append(byte)
             packets.append(self._make_packet(self._PRINT_ROW_CMD, row_bytes))
 
+        # Add paper feed packets
+        for _ in range(10):
+            packets.append(self._make_packet(self._FEED_PAPER_CMD, [25, 0]))
+
+        # Connect and send all packets
         sock = None
         try:
             sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+            sock.settimeout(10)
             sock.connect((self._mac_address, BT_PRINTER_CHANNEL))
-            time.sleep(0.6)
+            time.sleep(0.8)
             for packet in packets:
-                sock.send(packet)
+                sock.sendall(packet)
                 if BT_PRINTER_ROW_DELAY_SECONDS > 0:
                     time.sleep(BT_PRINTER_ROW_DELAY_SECONDS)
-            sock.send(self._make_packet(self._FEED_PAPER_CMD, [0x32, 0x00]))
-            time.sleep(0.8)
+            time.sleep(1.0)
         finally:
             if sock is not None:
                 try:
@@ -1439,17 +1468,18 @@ class ReceiptPrinter:
                     pass
 
     def _print_receipt_raw_bt(self, session_id: str, cart: SessionCart, total: float, payment_ref: str) -> None:
+        """Build and send receipt using N4 raw Bluetooth mode."""
         image = self._build_receipt_image(session_id, cart, total, payment_ref)
         self._send_image_raw_bluetooth(image)
 
     def print_receipt(self, session_id: str, cart: SessionCart, total: float, payment_ref: str):
-        """Print a receipt for the transaction."""
+        """Print a receipt for the transaction using configured printer backend."""
         if self._mode is None:
             logger.warning("No printer available; skipping receipt for %s", session_id)
             return
 
         try:
-            logger.info("[PRINTER] Connecting to Bluetooth printer...")
+            logger.info("[PRINTER] Printing receipt for %s", session_id)
             if self._mode == "escpos" and self._printer is not None:
                 self._printer.text(f"{SHOP_NAME}\n")
                 self._printer.text("=" * 32 + "\n")
@@ -1476,13 +1506,12 @@ class ReceiptPrinter:
                 logger.warning("No compatible printer backend active; skipping receipt for %s", session_id)
                 return
 
-            logger.info("[PRINTER] Invoice printed successfully")
-            logger.info("Receipt printed for %s", session_id)
+            logger.info("[PRINTER] Receipt printed successfully for %s", session_id)
         except Exception as exc:
             logger.error("[PRINTER] Print failed: %s", exc)
-            logger.error("Receipt print failed: %s", exc)
 
     def close(self) -> None:
+        """Release printer resources."""
         if self._mode != "escpos" or not self._printer:
             return
         try:
