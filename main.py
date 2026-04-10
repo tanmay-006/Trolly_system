@@ -150,6 +150,9 @@ TFT_SPI_DEVICE = int(os.getenv("TFT_SPI_DEVICE", "0"))
 TFT_DC_PIN = int(os.getenv("TFT_DC_PIN", "24"))
 TFT_RST_PIN = int(os.getenv("TFT_RST_PIN", "25"))
 TFT_BUS_SPEED_HZ = int(os.getenv("TFT_BUS_SPEED_HZ", "4000000"))
+# ST7735 RAM offsets: many 160x128 panels need non-zero offsets to avoid top/left border artifacts.
+TFT_H_OFFSET = int(os.getenv("TFT_H_OFFSET", "1"))
+TFT_V_OFFSET = int(os.getenv("TFT_V_OFFSET", "2"))
 TFT_REINIT_SECONDS = float(os.getenv("TFT_REINIT_SECONDS", "25"))
 TFT_CLEANUP_ON_EXIT = os.getenv("TFT_CLEANUP_ON_EXIT", "0").strip().lower() in {
     "1", "true", "yes"
@@ -689,20 +692,43 @@ class TFTDisplay:
                 gpio_RST=TFT_RST_PIN,
                 bus_speed_hz=TFT_BUS_SPEED_HZ,
             )
-            self._device = st7735(
-                serial,
-                width=TFT_WIDTH,
-                height=TFT_HEIGHT,
-                rotate=2,
-                bgr=True,
-            )
+            base_kwargs = {
+                "width": TFT_WIDTH,
+                "height": TFT_HEIGHT,
+                "rotate": 2,
+                "bgr": True,
+            }
+
+            try:
+                # Preferred names used by current luma.lcd versions.
+                self._device = st7735(
+                    serial,
+                    h_offset=TFT_H_OFFSET,
+                    v_offset=TFT_V_OFFSET,
+                    **base_kwargs,
+                )
+            except TypeError:
+                try:
+                    # Backward compatibility with older parameter names.
+                    self._device = st7735(
+                        serial,
+                        x_offset=TFT_H_OFFSET,
+                        y_offset=TFT_V_OFFSET,
+                        **base_kwargs,
+                    )
+                except TypeError:
+                    # Final fallback for older luma builds without offset args.
+                    self._device = st7735(serial, **base_kwargs)
+
             logger.info(
-                "TFT display initialized (port=%d device=%d dc=%d rst=%d speed=%d)",
+                "TFT display initialized (port=%d device=%d dc=%d rst=%d speed=%d h_off=%d v_off=%d)",
                 TFT_SPI_PORT,
                 TFT_SPI_DEVICE,
                 TFT_DC_PIN,
                 TFT_RST_PIN,
                 TFT_BUS_SPEED_HZ,
+                TFT_H_OFFSET,
+                TFT_V_OFFSET,
             )
             return True
         except Exception as exc:
